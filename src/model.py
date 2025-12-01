@@ -44,6 +44,12 @@ class AdvancedLSTM(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(lstm_output_dim, num_classes)
         
+        # Başlangıç bias'ını Normal lehine ayarla (Normal verisi daha fazla)
+        # Normal sınıfına pozitif, Skolyoz'a negatif bias
+        with torch.no_grad():
+            self.fc.bias[0] = 0.1  # Normal bias (pozitif)
+            self.fc.bias[1] = -0.1  # Scoliosis bias (negatif)
+        
     def forward(self, x):
         # Input normalization (batch_first için transpose gerekli)
         batch_size, seq_len, features = x.shape

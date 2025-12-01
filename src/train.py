@@ -221,16 +221,27 @@ def main():
     scoliosis_count = train_labels.count(1)
     total = normal_count + scoliosis_count
     
-    # Inverse frequency weighting - azınlık sınıfına daha fazla ağırlık
-    weight_normal = total / (2 * normal_count) if normal_count > 0 else 1.0
-    weight_scoliosis = total / (2 * scoliosis_count) if scoliosis_count > 0 else 1.0
+    # Geliştirilmiş class weighting - Normal sınıfına daha fazla ağırlık
+    # Normal verisi daha fazla olmasına rağmen daha kötü performans gösteriyor
+    # Bu yüzden çok daha agresif weighting uyguluyoruz
+    if normal_count > 0 and scoliosis_count > 0:
+        # Normal sınıfına 3x daha fazla ağırlık ver (Normal verisi daha fazla ama daha zor)
+        # Normal örnekler daha çeşitli olduğu için daha fazla ağırlık gerekiyor
+        weight_normal = (total / (1.5 * normal_count)) * 3.0  # Çok daha agresif
+        weight_scoliosis = total / (2 * scoliosis_count)
+    else:
+        weight_normal = 1.0
+        weight_scoliosis = 1.0
     class_weights = [weight_normal, weight_scoliosis]
     
     print(f"📊 Sınıf dağılımı - Normal: {normal_count}, Scoliosis: {scoliosis_count}")
     print(f"📊 Class weights: Normal={weight_normal:.2f}, Scoliosis={weight_scoliosis:.2f}")
     
-    # Model oluştur
-    model = build_model(model_type=args.model_type)
+    # Model oluştur - Attention mekanizmasını aktif et (%80+ accuracy için)
+    if args.model_type == "advanced_lstm":
+        model = build_model(model_type=args.model_type, use_attention=True)
+    else:
+        model = build_model(model_type=args.model_type)
     model = model.to(device)
     
     print(f"📊 Model: {args.model_type}")

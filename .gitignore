@@ -29,14 +29,17 @@ ENV/
 # Dataset & Data Files
 dataset/
 datasets/
+datasettest/
 test/
 npy_normal/
 npy_scoliosis/
 npys_scoliosis/
 testkeypoints/
+keypointstest/
 keypoints/
 test_videos/
 visualized_videos/
+saved_videos/
 
 # Model Files (büyük dosyalar)
 saved_models/*.pth

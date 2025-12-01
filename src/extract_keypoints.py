@@ -193,6 +193,7 @@ class PoseExtractor:
 def find_all_videos(dataset_root: str) -> Dict[str, list]:
     """
     Dataset klasöründeki tüm videoları bulur
+    Hem eski yapıyı (normal/front/) hem de yeni yapıyı (normal/) destekler
     
     Args:
         dataset_root: Dataset kök klasörü
@@ -208,14 +209,22 @@ def find_all_videos(dataset_root: str) -> Dict[str, list]:
     supported_formats = ['.avi', '.mp4', '.mov', '.mkv', '.wmv', '.flv']
     
     for class_name in ['normal', 'scoliosis']:
-        for view in ['front']:
-            view_dir = os.path.join(dataset_root, class_name, view)
-            
-            if os.path.exists(view_dir):
+        # Önce eski yapıyı kontrol et (normal/front/)
+        front_dir = os.path.join(dataset_root, class_name, 'front')
+        if os.path.exists(front_dir):
+            for ext in supported_formats:
+                pattern = os.path.join(front_dir, f"*{ext}")
+                videos = glob.glob(pattern)
+                video_dict[class_name]['front'].extend(videos)
+        
+        # Eğer front/ klasörü yoksa, direkt normal/ klasörünü kontrol et (yeni yapı)
+        if len(video_dict[class_name]['front']) == 0:
+            class_dir = os.path.join(dataset_root, class_name)
+            if os.path.exists(class_dir):
                 for ext in supported_formats:
-                    pattern = os.path.join(view_dir, f"*{ext}")
+                    pattern = os.path.join(class_dir, f"*{ext}")
                     videos = glob.glob(pattern)
-                    video_dict[class_name][view].extend(videos)
+                    video_dict[class_name]['front'].extend(videos)
     
     return video_dict
 

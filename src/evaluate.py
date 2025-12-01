@@ -64,8 +64,11 @@ def main():
         person_based_split=True  # Person-based split (overfitting önleme)
     )
     
-    # Model oluştur ve yükle
-    model = build_model(model_type=args.model_type)
+    # Model oluştur ve yükle - Attention mekanizmasını aktif et (eğer advanced_lstm ise)
+    if args.model_type == "advanced_lstm":
+        model = build_model(model_type=args.model_type, use_attention=True)
+    else:
+        model = build_model(model_type=args.model_type)
     model = model.to(device)
     
     load_checkpoint(args.model_path, model)

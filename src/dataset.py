@@ -20,7 +20,7 @@ class KeypointDataset(Dataset):
     """Keypoint verileri için PyTorch Dataset - İyileştirilmiş"""
     
     def __init__(self, keypoint_paths: List[str], labels: List[int], 
-                 max_sequence_length: int = 100, normalize: bool = True,
+                 max_sequence_length: int = 150, normalize: bool = True,
                  augment: bool = False, is_training: bool = False):
         """
         Args:
@@ -66,42 +66,56 @@ class KeypointDataset(Dataset):
         return normalized
     
     def _augment_keypoints(self, keypoints: np.ndarray) -> np.ndarray:
-        """Postür analizi için özelleştirilmiş data augmentation"""
+        """Geliştirilmiş data augmentation - %80+ accuracy için"""
         augmented = keypoints.copy()
         
-        # 1. Hafif Gaussian noise (çok agresif olmamalı)
-        if np.random.rand() > 0.5:
-            noise_scale = np.random.uniform(0.002, 0.01)
+        # 1. Gaussian noise (daha geniş aralık)
+        if np.random.rand() > 0.3:  # %70 şans
+            noise_scale = np.random.uniform(0.01, 0.03)  # Daha geniş aralık
             for i in range(0, keypoints.shape[1], 3):
                 augmented[:, i] += np.random.normal(0, noise_scale, keypoints.shape[0])
                 augmented[:, i+1] += np.random.normal(0, noise_scale, keypoints.shape[0])
         
-        # 2. Horizontal flip (x koordinatlarını çevir) - simetrik veri artırma
-        if np.random.rand() > 0.5:
-            for i in range(0, keypoints.shape[1], 3):
-                # X koordinatını 0.5 etrafında çevir (normalize edilmiş koordinatlar için)
-                augmented[:, i] = 1.0 - augmented[:, i]
-        
-        # 3. Hafif translation (kaydırma)
-        if np.random.rand() > 0.5:
-            tx = np.random.uniform(-0.05, 0.05)
-            ty = np.random.uniform(-0.05, 0.05)
+        # 2. Translation (daha geniş aralık)
+        if np.random.rand() > 0.3:  # %70 şans
+            tx = np.random.uniform(-0.08, 0.08)  # Daha geniş
+            ty = np.random.uniform(-0.08, 0.08)
             for i in range(0, keypoints.shape[1], 3):
                 augmented[:, i] += tx
                 augmented[:, i+1] += ty
         
-        # 4. Temporal subsampling (bazı frame'leri atla)
-        if np.random.rand() > 0.7 and len(keypoints) > 20:
-            # Her 2. veya 3. frame'i al
+        # 3. Scaling (yeni - postür varyasyonları için)
+        if np.random.rand() > 0.5:  # %50 şans
+            scale = np.random.uniform(0.95, 1.05)  # Hafif ölçekleme
+            # Merkez noktasını bul
+            center_x = np.mean([augmented[:, i].mean() for i in range(0, keypoints.shape[1], 3)])
+            center_y = np.mean([augmented[:, i+1].mean() for i in range(0, keypoints.shape[1], 3)])
+            # Ölçekle
+            for i in range(0, keypoints.shape[1], 3):
+                augmented[:, i] = (augmented[:, i] - center_x) * scale + center_x
+                augmented[:, i+1] = (augmented[:, i+1] - center_y) * scale + center_y
+        
+        # 4. Temporal subsampling (daha sık)
+        if np.random.rand() > 0.5 and len(keypoints) > 20:  # %50 şans
             step = np.random.choice([2, 3])
             indices = np.arange(0, len(augmented), step)
             subsampled = augmented[indices]
-            # Tekrar orijinal uzunluğa getir (interpolation benzeri)
             if len(subsampled) < len(augmented):
                 ratio = len(augmented) / len(subsampled)
                 new_indices = (np.arange(len(augmented)) / ratio).astype(int)
                 new_indices = np.clip(new_indices, 0, len(subsampled) - 1)
                 augmented = subsampled[new_indices]
+        
+        # 5. Keypoint dropout (yeni - eksik keypoint'lere karşı dayanıklılık)
+        if np.random.rand() > 0.7:  # %30 şans
+            dropout_rate = np.random.uniform(0.05, 0.15)  # %5-15 keypoint'i sıfırla
+            num_keypoints = keypoints.shape[1] // 3
+            num_to_drop = int(num_keypoints * dropout_rate)
+            keypoint_indices = np.random.choice(num_keypoints, num_to_drop, replace=False)
+            for idx in keypoint_indices:
+                i = idx * 3
+                augmented[:, i] = 0
+                augmented[:, i+1] = 0
         
         return augmented
     
@@ -126,12 +140,14 @@ class KeypointDataset(Dataset):
             
             # Sequence uzunluğunu sınırla
             if len(keypoints) > self.max_sequence_length:
-                # Rastgele bir başlangıç noktası seç (training için)
+                # Training: rastgele bir başlangıç noktası seç
                 if self.is_training:
                     start_idx = np.random.randint(0, len(keypoints) - self.max_sequence_length + 1)
                     keypoints = keypoints[start_idx:start_idx + self.max_sequence_length]
                 else:
-                    keypoints = keypoints[:self.max_sequence_length]
+                    # Test: orta frame'leri al (daha stabil ve tutarlı)
+                    start_idx = (len(keypoints) - self.max_sequence_length) // 2
+                    keypoints = keypoints[start_idx:start_idx + self.max_sequence_length]
             
             # Padding ekle
             if len(keypoints) < self.max_sequence_length:
@@ -161,37 +177,22 @@ class KeypointDataset(Dataset):
 def extract_person_id(video_path: str) -> str:
     """
     Video path'inden kişi ID'sini çıkar
-    Farklı kamera açıları (kamera1/kamera2) aynı kişi olarak işaretlenir
+    HER VİDEO FARKLI BİR KİŞİ OLARAK KABUL EDİLİR (benzersiz ID)
+    
+    Bu, person-based split'in doğru çalışması için gereklidir.
+    Eğer gerçekten aynı kişinin birden fazla videosu varsa,
+    bu videolar aynı kişi ID'sine sahip olmalıdır.
     
     Örnekler:
-        "kamera1_20251005_121101.avi" -> "20251005_121101" (timestamp = kişi)
-        "kamera2_20251005_121101.avi" -> "20251005_121101" (aynı kişi, farklı açı)
-        "hasta_onden_1.mov" -> "hasta_onden_1"
-        "WIN_20251023_12_48_08_Pro.mp4" -> "WIN_20251023_12_48_08_Pro"
-        "saglam1.avi" -> "saglam1"
+        "kamera1_20251005_120022.avi" -> "kamera1_20251005_120022" (benzersiz)
+        "kamera1_20251005_120132.avi" -> "kamera1_20251005_120132" (farklı kişi)
+        "normal1.avi" -> "normal1" (benzersiz)
+        "hasta25.mov" -> "hasta25" (benzersiz)
     """
     filename = os.path.basename(video_path)
+    # Dosya adını (uzantı olmadan) kişi ID olarak kullan
+    # Bu, her video'yu benzersiz bir kişi olarak kabul eder
     name_without_ext = filename.rsplit('.', 1)[0]
-    
-    # kamera1_* veya kamera2_* formatı -> timestamp'i kişi ID olarak kullan
-    if name_without_ext.startswith('kamera1_') or name_without_ext.startswith('kamera2_'):
-        # kamera1_20251005_121101 -> 20251005_121101
-        parts = name_without_ext.split('_', 1)
-        if len(parts) > 1:
-            return parts[1]
-    
-    # hasta_kamera* formatı
-    if name_without_ext.startswith('hasta_kamera'):
-        # hasta_kamera2_20251005_114655 -> hasta_20251005_114655
-        parts = name_without_ext.split('_', 2)
-        if len(parts) > 2:
-            return 'hasta_' + parts[2]
-    
-    # saglam* formatı (normal videolar)
-    if name_without_ext.startswith('saglam'):
-        return name_without_ext  # saglam1, saglam2, etc.
-    
-    # Diğer tüm durumlar için dosya adını kullan
     return name_without_ext
 
 
@@ -230,9 +231,15 @@ def load_dataset_from_keypoints(keypoints_dir: str, test_size: float = 0.2,
         video_path = item['video_path']
         keypoint_path = item['keypoint_path']
         
-        # SADECE FRONT VİDEOLARI KULLAN
-        if '/front/' not in video_path.lower() and '\\front\\' not in video_path.lower():
-            continue  # Front değilse atla
+        # FRONT VİDEOLARI KULLAN (eğer front/side ayrımı varsa)
+        # Eğer front/ klasörü yoksa, direkt normal/scoliosis klasöründeki videoları kullan
+        has_front_structure = '/front/' in video_path.lower() or '\\front\\' in video_path.lower()
+        has_side_structure = '/side/' in video_path.lower() or '\\side\\' in video_path.lower()
+        
+        # Eğer side/ klasörü varsa ama front/ yoksa, side videoları atla
+        # Eğer hiç front/side yapısı yoksa, tüm videoları kullan
+        if has_side_structure and not has_front_structure:
+            continue  # Side videoları atla (sadece front/side yapısı varsa)
         
         # Class belirle (normal/scoliosis)
         if 'normal' in video_path.lower():

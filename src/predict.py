@@ -45,14 +45,24 @@ def predict_video(model, video_path: str, extractor: PoseExtractor,
             "video_path": video_path
         }
     
-    # Normalize et
+    # Normalize et - Eğitim sırasında kullanılan Z-score normalizasyonu ile aynı
+    # (dataset.py'deki _normalize_keypoints ile aynı)
     for i in range(0, keypoints.shape[1], 3):
-        if keypoints[:, i].max() > 0:
-            keypoints[:, i] = (keypoints[:, i] - keypoints[:, i].min()) / \
-                             (keypoints[:, i].max() - keypoints[:, i].min() + 1e-8)
-        if keypoints[:, i+1].max() > 0:
-            keypoints[:, i+1] = (keypoints[:, i+1] - keypoints[:, i+1].min()) / \
-                              (keypoints[:, i+1].max() - keypoints[:, i+1].min() + 1e-8)
+        # X koordinatı - Z-score normalization
+        x_col = keypoints[:, i]
+        if x_col.std() > 1e-8:
+            keypoints[:, i] = (x_col - x_col.mean()) / (x_col.std() + 1e-8)
+        else:
+            keypoints[:, i] = x_col - x_col.mean()
+        
+        # Y koordinatı - Z-score normalization
+        y_col = keypoints[:, i+1]
+        if y_col.std() > 1e-8:
+            keypoints[:, i+1] = (y_col - y_col.mean()) / (y_col.std() + 1e-8)
+        else:
+            keypoints[:, i+1] = y_col - y_col.mean()
+        
+        # Visibility değişmez (zaten normalize edilmiş)
     
     # Sequence uzunluğunu sınırla
     if len(keypoints) > max_sequence_length:
@@ -167,9 +177,12 @@ def main():
     if torch.cuda.is_available():
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
     
-    # Model oluştur ve yükle
+    # Model oluştur ve yükle - Attention mekanizmasını aktif et (eğer advanced_lstm ise)
     print(f"📂 Model yükleniyor: {args.model_path}")
-    model = build_model(model_type=args.model_type)
+    if args.model_type == "advanced_lstm":
+        model = build_model(model_type=args.model_type, use_attention=True)
+    else:
+        model = build_model(model_type=args.model_type)
     model = model.to(device)
     
     load_checkpoint(args.model_path, model)
@@ -208,8 +221,13 @@ def main():
         video_extensions = ['*.avi', '*.mp4', '*.mov', '*.mkv', '*.wmv', '*.flv']
         video_paths = []
         for ext in video_extensions:
-            video_paths.extend(glob.glob(os.path.join(args.video_dir, ext)))
-            video_paths.extend(glob.glob(os.path.join(args.video_dir, '**', ext), recursive=True))
+            # Sadece recursive arama yap, duplicate'leri önlemek için
+            found = glob.glob(os.path.join(args.video_dir, '**', ext), recursive=True)
+            video_paths.extend(found)
+        
+        # Duplicate'leri kaldır (aynı dosya farklı yollardan bulunmuş olabilir)
+        video_paths = list(set([os.path.abspath(v) for v in video_paths]))
+        video_paths.sort()  # Sıralı olsun
         
         if not video_paths:
             print(f"❌ {args.video_dir} klasöründe video bulunamadı!")

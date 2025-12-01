@@ -28,6 +28,62 @@ model = None
 extractor = None
 device = None
 
+# Proje root dizinini bul
+def get_project_root():
+    """Proje root dizinini bul"""
+    current_file = os.path.abspath(__file__)
+    # src/visualize_gui.py -> proje root
+    project_root = os.path.dirname(os.path.dirname(current_file))
+    return project_root
+
+# En iyi modeli otomatik yükle
+def auto_load_best_model():
+    """En iyi modeli otomatik yükle (dataset_improved.pth)"""
+    global model, extractor, device
+    
+    # Proje root dizinini bul
+    project_root = get_project_root()
+    model_path = os.path.join(project_root, "saved_models", "dataset_improved.pth")
+    
+    # Alternatif path'leri dene
+    possible_paths = [
+        model_path,  # Proje root'tan
+        "saved_models/dataset_improved.pth",  # Mevcut dizinden
+        os.path.join(os.getcwd(), "saved_models", "dataset_improved.pth"),  # Çalışma dizininden
+    ]
+    
+    model_path = None
+    for path in possible_paths:
+        if os.path.exists(path):
+            model_path = path
+            break
+    
+    if model_path is None:
+        # Tüm modelleri listele
+        saved_models_dir = os.path.join(project_root, "saved_models")
+        available_models = []
+        if os.path.exists(saved_models_dir):
+            available_models = [f for f in os.listdir(saved_models_dir) if f.endswith('.pth')]
+        
+        models_list = "\n".join([f"  - {m}" for m in available_models]) if available_models else "  (none found)"
+        return False, f"❌ Best model not found!\n\nSearched paths:\n  - {os.path.join(project_root, 'saved_models', 'dataset_improved.pth')}\n  - saved_models/dataset_improved.pth\n  - {os.path.join(os.getcwd(), 'saved_models', 'dataset_improved.pth')}\n\nAvailable models in saved_models/:\n{models_list}\n\nCurrent directory: {os.getcwd()}\nProject root: {project_root}"
+    
+    try:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # AdvancedLSTM with attention
+        model = build_model(model_type="advanced_lstm", use_attention=True)
+        model = model.to(device)
+        load_checkpoint(model_path, model)
+        model.eval()
+        
+        extractor = PoseExtractor()
+        
+        gpu_info = f"GPU: {torch.cuda.get_device_name(0)}" if torch.cuda.is_available() else "CPU"
+        return True, f"✅ Best model loaded automatically!\n🧠 Model: dataset_improved (81.82% accuracy)\n📁 Path: {model_path}\n📱 Device: {gpu_info}"
+    except Exception as e:
+        return False, f"❌ Model loading error: {str(e)}\n\nTried path: {model_path}"
+
 
 def draw_keypoints_on_frame(frame, keypoint_coords):
     """Keypoint'leri frame üzerine çizer"""
@@ -184,53 +240,94 @@ def predict_skoliosis(keypoints_array, max_sequence_length=100):
         return None, 0, 0, 0, f"❌ Prediction error: {str(e)}"
 
 
-def process_video(video_file, keypoint_file=None, use_live_detection=True, use_prediction=False):
+def process_video(video_file):
     """Process video, draw keypoints and make prediction"""
+    global model
+    
     if video_file is None:
-        return None, "", "⚠️ Please select a video!"
+        return None, "", "⚠️ Please upload a video file!"
+    
+    # Model yüklü mü kontrol et
+    if model is None:
+        success, msg = auto_load_best_model()
+        if not success:
+            return None, "", f"❌ {msg}\n\nPlease ensure saved_models/dataset_improved.pth exists."
     
     try:
-        video_path = video_file.name if hasattr(video_file, 'name') else video_file
+        # Gradio file upload formatını handle et
+        if isinstance(video_file, str):
+            video_path = video_file
+        elif hasattr(video_file, 'name'):
+            video_path = video_file.name
+        elif isinstance(video_file, dict) and 'name' in video_file:
+            video_path = video_file['name']
+        else:
+            video_path = str(video_file)
+        
+        if not os.path.exists(video_path):
+            return None, "", f"❌ Video file not found: {video_path}"
         
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            return None, "", "❌ Video could not be opened!"
+            return None, "", f"❌ Video could not be opened: {video_path}"
         
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0 or fps != fps:  # NaN kontrolü
+            fps = 30.0  # Varsayılan FPS
+        fps = int(fps)
+        
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        # Keypoint'leri yükle veya çıkar
-        keypoints = None
+        if width <= 0 or height <= 0:
+            return None, "", f"❌ Invalid video dimensions: {width}x{height}"
+        
+        # Keypoint'leri canlı olarak çıkar
         all_keypoints_list = []
         
-        pose = None
-        if use_live_detection or keypoint_file is None:
-            pose = mp_pose.Pose(
-                static_image_mode=False,
-                model_complexity=1,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5
-            )
-        elif keypoint_file:
-            keypoint_path = keypoint_file.name if hasattr(keypoint_file, 'name') else keypoint_file
-            if os.path.exists(keypoint_path):
-                keypoints = np.load(keypoint_path)
+        pose = mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
         
-        # Çıkış video
-        output_dir = tempfile.mkdtemp()
-        output_path = os.path.join(output_dir, f"keypoint_video_{os.getpid()}.mp4")
+        # Çıkış video - kalıcı klasöre kaydet
+        project_root = get_project_root()
+        saved_videos_dir = os.path.join(project_root, "saved_videos")
+        os.makedirs(saved_videos_dir, exist_ok=True)
         
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        # Benzersiz dosya adı oluştur
+        import time
+        timestamp = int(time.time())
+        video_name = f"analysis_{timestamp}_{os.getpid()}.mp4"
+        output_path = os.path.join(saved_videos_dir, video_name)
         
-        if not out.isOpened():
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        # Video codec'leri sırayla dene
+        codecs_to_try = [
+            ('avc1', 'H.264'),
+            ('mp4v', 'MPEG-4'),
+            ('XVID', 'XVID'),
+            ('MJPG', 'Motion JPEG')
+        ]
         
-        if not out.isOpened():
-            return None, "", "❌ Video codec could not be opened!"
+        out = None
+        used_codec = None
+        for codec_name, codec_desc in codecs_to_try:
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*codec_name)
+                out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+                if out.isOpened():
+                    used_codec = codec_desc
+                    break
+                else:
+                    out.release()
+            except:
+                continue
+        
+        if out is None or not out.isOpened():
+            return None, "", f"❌ Video codec could not be opened! Tried: {', '.join([c[1] for c in codecs_to_try])}"
         
         frame_count = 0
         detected_frames = 0
@@ -245,44 +342,25 @@ def process_video(video_file, keypoint_file=None, use_live_detection=True, use_p
             keypoint_coords = []
             frame_keypoints = []
             
-            if use_live_detection and pose:
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = pose.process(rgb_frame)
+            # Canlı keypoint çıkarımı
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = pose.process(rgb_frame)
+            
+            if results.pose_landmarks:
+                has_pose = True
+                detected_frames += 1
                 
-                if results.pose_landmarks:
-                    has_pose = True
-                    detected_frames += 1
-                    
-                    for landmark in results.pose_landmarks.landmark:
-                        x_pixel = int(landmark.x * width)
-                        y_pixel = int(landmark.y * height)
-                        keypoint_coords.append((x_pixel, y_pixel, landmark.visibility))
-                        frame_keypoints.extend([landmark.x, landmark.y, landmark.visibility])
-                    
-                    annotated_frame = draw_keypoints_on_frame(annotated_frame, keypoint_coords)
-                else:
-                    frame_keypoints = [0.0] * 99
+                for landmark in results.pose_landmarks.landmark:
+                    x_pixel = int(landmark.x * width)
+                    y_pixel = int(landmark.y * height)
+                    keypoint_coords.append((x_pixel, y_pixel, landmark.visibility))
+                    frame_keypoints.extend([landmark.x, landmark.y, landmark.visibility])
                 
-                all_keypoints_list.append(frame_keypoints)
-            elif keypoints is not None:
-                if frame_count < len(keypoints):
-                    frame_keypoints_data = keypoints[frame_count]
-                    
-                    for i in range(0, len(frame_keypoints_data), 3):
-                        x_norm = frame_keypoints_data[i]
-                        y_norm = frame_keypoints_data[i + 1]
-                        visibility = frame_keypoints_data[i + 2]
-                        
-                        x_pixel = int(x_norm * width)
-                        y_pixel = int(y_norm * height)
-                        keypoint_coords.append((x_pixel, y_pixel, visibility))
-                        
-                        if visibility > 0.5:
-                            has_pose = True
-                    
-                    if has_pose:
-                        detected_frames += 1
-                        annotated_frame = draw_keypoints_on_frame(annotated_frame, keypoint_coords)
+                annotated_frame = draw_keypoints_on_frame(annotated_frame, keypoint_coords)
+            else:
+                frame_keypoints = [0.0] * 99
+            
+            all_keypoints_list.append(frame_keypoints)
             
             color = (0, 255, 0) if has_pose else (0, 0, 255)
             text = "POSE DETECTED" if has_pose else "NO POSE"
@@ -295,181 +373,264 @@ def process_video(video_file, keypoint_file=None, use_live_detection=True, use_p
             frame_count += 1
         
         cap.release()
-        out.release()
+        if out:
+            out.release()
         if pose:
             pose.close()
         
+        # Video dosyasının oluşturulduğundan emin ol
         import time
-        time.sleep(0.2)
+        max_wait = 10  # Maksimum 10 saniye bekle
+        wait_time = 0
+        while not os.path.exists(output_path) and wait_time < max_wait:
+            time.sleep(0.2)
+            wait_time += 0.2
         
         if not os.path.exists(output_path):
-            return None, "", "❌ Video file could not be created!"
+            return None, "", f"❌ Video file could not be created: {output_path}"
+        
+        # Dosyanın tamamen yazıldığından emin ol (dosya boyutu sabit kalana kadar bekle)
+        prev_size = 0
+        stable_count = 0
+        for _ in range(20):  # Maksimum 2 saniye bekle
+            time.sleep(0.1)
+            if os.path.exists(output_path):
+                current_size = os.path.getsize(output_path)
+                if current_size == prev_size and current_size > 0:
+                    stable_count += 1
+                    if stable_count >= 3:  # 3 kez aynı boyutta ise tamamlanmış demektir
+                        break
+                else:
+                    stable_count = 0
+                prev_size = current_size
+        
+        # Mutlak path'e çevir (Gradio için gerekli)
+        output_path = os.path.abspath(output_path)
+        
+        # Dosyanın okunabilir olduğundan emin ol
+        if not os.access(output_path, os.R_OK):
+            return None, "", f"❌ Video file is not readable: {output_path}"
         
         detection_rate = (detected_frames / frame_count) * 100 if frame_count > 0 else 0
         
-        # Tahmin yap
+        # Tahmin yap (her zaman yapılır)
         prediction_result = ""
         prediction_label = ""
         normal_prob = 0
         scoliosis_prob = 0
         confidence = 0
         
-        if use_prediction and model is not None:
-            if use_live_detection and len(all_keypoints_list) > 0:
-                keypoints_array = np.array(all_keypoints_list)
-            elif keypoints is not None:
-                keypoints_array = keypoints
-            else:
-                keypoints_array = None
-            
-            if keypoints_array is not None:
-                prediction_label, confidence, normal_prob, scoliosis_prob, pred_msg = predict_skoliosis(keypoints_array)
-                prediction_result = "completed"  # Flag to indicate prediction was done
+        if model is not None and len(all_keypoints_list) > 0:
+            keypoints_array = np.array(all_keypoints_list)
+            prediction_label, confidence, normal_prob, scoliosis_prob, pred_msg = predict_skoliosis(keypoints_array)
+            prediction_result = "completed"
         
-        info = f"## ✅ Process Completed!\n\n"
+        info = f"## ✅ Analysis Completed!\n\n"
         info += f"### 📹 Video Information\n"
         info += f"- **Total frames:** {frame_count}\n"
-        info += f"- **Pose detected:** {detected_frames}\n"
-        info += f"- **Detection rate:** {detection_rate:.1f}%\n\n"
+        info += f"- **Pose detected:** {detected_frames} frames\n"
+        info += f"- **Detection rate:** {detection_rate:.1f}%\n"
+        info += f"- **Video resolution:** {width}x{height}\n"
+        info += f"- **FPS:** {fps}\n\n"
         
         if prediction_result == "completed" and prediction_label:
-            info += f"### 🎯 Analysis Result\n"
-            info += f"- **Prediction:** {prediction_label}\n"
+            info += f"### 🎯 AI Analysis Result\n"
+            info += f"- **Prediction:** **{prediction_label}**\n"
             info += f"- **Confidence:** {confidence:.1f}%\n"
             info += f"- **Normal probability:** {normal_prob:.1f}%\n"
             info += f"- **Scoliosis probability:** {scoliosis_prob:.1f}%\n"
+            info += f"\n### 📊 Model Information\n"
+            info += f"- **Model:** dataset_improved (Best Model)\n"
+            info += f"- **Accuracy:** 81.82%\n"
+            info += f"- **Precision:** 86.36%\n"
+            info += f"- **Recall:** 81.82%\n"
         
         # HTML format prediction result
         prediction_html = ""
         if prediction_result == "completed" and prediction_label:
             if "Uncertain" in prediction_label:
                 prediction_html = f"""
-                <div style="background: #fff3cd; color: #856404; padding: 15px; border-radius: 8px; border: 2px solid #ffc107; text-align: center;">
-                    <h3 style="margin: 0 0 10px 0;">⚠️ Uncertain (Belirsiz)</h3>
-                    <p style="margin: 5px 0;"><strong>Confidence too low:</strong> {confidence:.1f}%</p>
-                    <p style="margin: 5px 0;"><strong>Normal:</strong> {normal_prob:.1f}% | <strong>Scoliosis:</strong> {scoliosis_prob:.1f}%</p>
-                    <p style="margin: 5px 0; font-size: 0.9em;">Model emin değil - daha net bir video deneyin</p>
+                <div style="background: linear-gradient(135deg, #fff3cd 0%, #ffeaa7 100%); color: #856404; padding: 25px; border-radius: 12px; border: 3px solid #ffc107; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+                    <div style="font-size: 3em; margin-bottom: 15px;">⚠️</div>
+                    <h2 style="margin: 0 0 15px 0; font-size: 1.8em; font-weight: bold;">Uncertain Result</h2>
+                    <p style="margin: 10px 0; font-size: 1.1em;"><strong>Confidence Level:</strong> {confidence:.1f}%</p>
+                    <div style="display: flex; justify-content: space-around; margin: 20px 0; padding: 15px; background: rgba(255,255,255,0.3); border-radius: 8px;">
+                        <div>
+                            <p style="margin: 5px 0; font-size: 0.9em; opacity: 0.8;">Normal</p>
+                            <p style="margin: 5px 0; font-size: 1.5em; font-weight: bold;">{normal_prob:.1f}%</p>
+                        </div>
+                        <div>
+                            <p style="margin: 5px 0; font-size: 0.9em; opacity: 0.8;">Scoliosis</p>
+                            <p style="margin: 5px 0; font-size: 1.5em; font-weight: bold;">{scoliosis_prob:.1f}%</p>
+                        </div>
+                    </div>
+                    <p style="margin: 15px 0 0 0; font-size: 0.95em; font-style: italic;">Model confidence is too low. Please try with a clearer video.</p>
                 </div>
                 """
             elif prediction_label == "Normal":
                 prediction_html = f"""
-                <div style="background: #d4edda; color: #155724; padding: 15px; border-radius: 8px; border: 2px solid #28a745; text-align: center;">
-                    <h3 style="margin: 0 0 10px 0;">✅ {prediction_label}</h3>
-                    <p style="margin: 5px 0;"><strong>Confidence:</strong> {confidence:.1f}%</p>
-                    <p style="margin: 5px 0;"><strong>Normal:</strong> {normal_prob:.1f}% | <strong>Scoliosis:</strong> {scoliosis_prob:.1f}%</p>
+                <div style="background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%); color: #155724; padding: 25px; border-radius: 12px; border: 3px solid #28a745; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+                    <div style="font-size: 3em; margin-bottom: 15px;">✅</div>
+                    <h2 style="margin: 0 0 15px 0; font-size: 1.8em; font-weight: bold;">Normal Posture</h2>
+                    <p style="margin: 10px 0; font-size: 1.1em;"><strong>Confidence:</strong> {confidence:.1f}%</p>
+                    <div style="display: flex; justify-content: space-around; margin: 20px 0; padding: 15px; background: rgba(255,255,255,0.3); border-radius: 8px;">
+                        <div>
+                            <p style="margin: 5px 0; font-size: 0.9em; opacity: 0.8;">Normal</p>
+                            <p style="margin: 5px 0; font-size: 1.5em; font-weight: bold;">{normal_prob:.1f}%</p>
+                        </div>
+                        <div>
+                            <p style="margin: 5px 0; font-size: 0.9em; opacity: 0.8;">Scoliosis</p>
+                            <p style="margin: 5px 0; font-size: 1.5em; font-weight: bold;">{scoliosis_prob:.1f}%</p>
+                        </div>
+                    </div>
+                    <p style="margin: 15px 0 0 0; font-size: 0.95em; color: #155724;">No signs of scoliosis detected in the analysis.</p>
                 </div>
                 """
             else:
                 prediction_html = f"""
-                <div style="background: #f8d7da; color: #721c24; padding: 15px; border-radius: 8px; border: 2px solid #dc3545; text-align: center;">
-                    <h3 style="margin: 0 0 10px 0;">⚠️ {prediction_label}</h3>
-                    <p style="margin: 5px 0;"><strong>Confidence:</strong> {confidence:.1f}%</p>
-                    <p style="margin: 5px 0;"><strong>Normal:</strong> {normal_prob:.1f}% | <strong>Scoliosis:</strong> {scoliosis_prob:.1f}%</p>
+                <div style="background: linear-gradient(135deg, #f8d7da 0%, #f5c6cb 100%); color: #721c24; padding: 25px; border-radius: 12px; border: 3px solid #dc3545; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+                    <div style="font-size: 3em; margin-bottom: 15px;">⚠️</div>
+                    <h2 style="margin: 0 0 15px 0; font-size: 1.8em; font-weight: bold;">Scoliosis Detected</h2>
+                    <p style="margin: 10px 0; font-size: 1.1em;"><strong>Confidence:</strong> {confidence:.1f}%</p>
+                    <div style="display: flex; justify-content: space-around; margin: 20px 0; padding: 15px; background: rgba(255,255,255,0.3); border-radius: 8px;">
+                        <div>
+                            <p style="margin: 5px 0; font-size: 0.9em; opacity: 0.8;">Normal</p>
+                            <p style="margin: 5px 0; font-size: 1.5em; font-weight: bold;">{normal_prob:.1f}%</p>
+                        </div>
+                        <div>
+                            <p style="margin: 5px 0; font-size: 0.9em; opacity: 0.8;">Scoliosis</p>
+                            <p style="margin: 5px 0; font-size: 1.5em; font-weight: bold;">{scoliosis_prob:.1f}%</p>
+                        </div>
+                    </div>
+                    <p style="margin: 15px 0 0 0; font-size: 0.95em; color: #721c24; font-weight: bold;">⚠️ Please consult with a medical professional for proper diagnosis.</p>
                 </div>
                 """
+        
+        # Video path'in mutlak path olduğundan ve dosyanın var olduğundan emin ol
+        if not os.path.isabs(output_path):
+            output_path = os.path.abspath(output_path)
+        
+        # Dosya boyutunu kontrol et (boş dosya olmamalı)
+        file_size = os.path.getsize(output_path)
+        if file_size == 0:
+            return None, "", "❌ Video file is empty!"
         
         return output_path, prediction_html, info
         
     except Exception as e:
-        return None, "", f"❌ Error: {str(e)}"
+        import traceback
+        error_details = traceback.format_exc()
+        error_msg = f"❌ Error occurred during video processing:\n\n{str(e)}\n\nDetails:\n{error_details}"
+        print(f"ERROR in process_video: {error_msg}")  # Console'a da yazdır
+        return None, "", error_msg
 
 
-# Gradio UI - Güzel tasarım
-with gr.Blocks() as demo:
+# Gradio UI - Profesyonel tasarım
+with gr.Blocks(title="Scoliosis Analysis System") as demo:
     gr.HTML("""
-    <div style="text-align: center; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; border-radius: 10px; color: white; margin-bottom: 20px;">
-        <h1 style="margin: 0; color: white;">🏥 Scoliosis Analysis System</h1>
-        <p style="margin: 10px 0 0 0;">Upload video, visualize keypoints, and perform AI-powered scoliosis analysis</p>
+    <div style="text-align: center; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; border-radius: 15px; color: white; margin-bottom: 30px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+        <h1 style="margin: 0; color: white; font-size: 2.5em; font-weight: bold;">🏥 Scoliosis Analysis System</h1>
+        <p style="margin: 15px 0 0 0; font-size: 1.2em; opacity: 0.95;">AI-Powered Posture Analysis & Scoliosis Detection</p>
+        <p style="margin: 10px 0 0 0; font-size: 0.9em; opacity: 0.85;">Upload video → Extract keypoints → AI analysis → Results</p>
     </div>
     """)
     
+    # Model durumu göster
+    model_status_display = gr.HTML()
+    
     with gr.Row():
         with gr.Column(scale=1):
-            gr.Markdown("### 📤 Input")
+            gr.Markdown("""
+            ### 📤 Upload Video
             
-            model_input = gr.File(
-                label="🤖 Model File (.pth)",
-                file_types=[".pth"]
-            )
-            
-            model_type_dropdown = gr.Dropdown(
-                choices=["advanced_lstm", "simple_lstm", "hybrid", "transformer", "posture"],
-                value="advanced_lstm",
-                label="🧠 Model Type (advanced_lstm: 80.65%)"
-            )
-            
-            load_model_btn = gr.Button("📥 Load Model", variant="secondary")
-            model_status = gr.Textbox(label="Model Status", interactive=False)
-            
-            gr.Markdown("---")
+            Upload a video file to analyze. The system will:
+            - Extract pose keypoints automatically
+            - Visualize keypoints on video
+            - Perform AI-powered scoliosis analysis
+            """)
             
             video_input = gr.File(
-                label="📹 Video File",
-                file_types=[".mp4", ".avi", ".mov", ".mkv"]
+                label="📹 Select Video File",
+                file_types=[".mp4", ".avi", ".mov", ".mkv", ".wmv"],
+                height=100
             )
             
-            keypoint_input = gr.File(
-                label="📊 Keypoint File (Optional)",
-                file_types=[".npy"]
+            process_btn = gr.Button(
+                "🚀 Analyze Video", 
+                variant="primary",
+                size="lg",
+                scale=2
             )
-            
-            with gr.Row():
-                use_live = gr.Checkbox(
-                    label="🔄 Live Keypoint Extraction",
-                    value=True
-                )
-                use_prediction = gr.Checkbox(
-                    label="🎯 Perform Scoliosis Analysis",
-                    value=True
-                )
-            
-            process_btn = gr.Button("🚀 Process and Analyze", variant="primary")
         
         with gr.Column(scale=1):
-            gr.Markdown("### 📺 Results")
+            gr.Markdown("### 📺 Analysis Results")
             
             video_output = gr.Video(
-                label="Video with Keypoints"
+                label="📹 Video with Keypoints Visualization",
+                height=400,
+                autoplay=True
             )
             
-            with gr.Group():
-                prediction_output = gr.HTML(label="🎯 Analysis Result")
+            prediction_output = gr.HTML(
+                label="🎯 Scoliosis Analysis Result",
+                elem_classes=["prediction-box"]
+            )
             
-            with gr.Accordion("📊 Detailed Information"):
+            with gr.Accordion("📊 Detailed Information", open=False):
                 info_output = gr.Markdown()
     
-    # Model yükleme
-    load_model_btn.click(
-        fn=load_model,
-        inputs=[model_input, model_type_dropdown],
-        outputs=[model_status]
-    )
+    gr.Markdown("""
+    ---
+    ### 📝 How to Use
+    
+    1. **Upload Video**: Click "Select Video File" and choose your video
+    2. **Analyze**: Click "Analyze Video" button
+    3. **View Results**: 
+       - Watch the video with keypoints visualized
+       - See the AI analysis result (Normal or Scoliosis)
+       - Check detailed statistics
+    
+    ### 🎯 Analysis Information
+    
+    - **Model**: Best performing model (81.82% accuracy)
+    - **Keypoints**: 33 body keypoints extracted using MediaPipe
+    - **Analysis**: Real-time AI prediction with confidence scores
+    
+    ### ⚠️ Important Notes
+    
+    - Video should show person from front view
+    - Ensure good lighting and clear visibility
+    - Results are for reference only - consult a medical professional for diagnosis
+    """)
+    
+    # Başlangıçta modeli yükle
+    def initialize_model():
+        success, msg = auto_load_best_model()
+        if success:
+            return f"""
+            <div style="background: #d4edda; color: #155724; padding: 15px; border-radius: 8px; border: 2px solid #28a745; margin-bottom: 20px;">
+                <h4 style="margin: 0 0 10px 0;">✅ {msg}</h4>
+            </div>
+            """
+        else:
+            return f"""
+            <div style="background: #f8d7da; color: #721c24; padding: 15px; border-radius: 8px; border: 2px solid #dc3545; margin-bottom: 20px;">
+                <h4 style="margin: 0 0 10px 0;">❌ {msg}</h4>
+            </div>
+            """
     
     # Video işleme
     process_btn.click(
         fn=process_video,
-        inputs=[video_input, keypoint_input, use_live, use_prediction],
+        inputs=[video_input],
         outputs=[video_output, prediction_output, info_output]
     )
     
-    gr.Markdown("""
-    ---
-    ### 📝 User Guide
-    
-    1. **Load Model**: Select your trained model file (.pth) and click "Load Model" button
-    2. **Upload Video**: Select the video file you want to analyze
-    3. **Keypoint File** (Optional): Select keypoint file if you have pre-extracted keypoints
-    4. **Settings**: 
-       - Live keypoint extraction: Use this option if you don't have keypoint file
-       - Scoliosis analysis: Makes prediction if model is loaded
-    5. **Process**: Click "Process and Analyze" button
-    
-    ### 🎯 Results
-    
-    - **Video with Keypoints**: Video displayed with keypoints drawn on it
-    - **Analysis Result**: Model prediction (Normal or Scoliosis) and confidence scores
-    - **Detailed Information**: Video and analysis statistics
-    """)
+    # Sayfa yüklendiğinde modeli yükle
+    demo.load(
+        fn=initialize_model,
+        outputs=[model_status_display]
+    )
 
 
 if __name__ == "__main__":
