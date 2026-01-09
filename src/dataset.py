@@ -198,7 +198,8 @@ def extract_person_id(video_path: str) -> str:
 
 def load_dataset_from_keypoints(keypoints_dir: str, test_size: float = 0.2, 
                                 random_state: int = 42, augment: bool = True,
-                                batch_size: int = 8, person_based_split: bool = True) -> Tuple[DataLoader, DataLoader]:
+                                batch_size: int = 8, person_based_split: bool = True,
+                                include_side_videos: bool = False) -> Tuple[DataLoader, DataLoader]:
     """
     Keypoint klasöründen dataset yükle
     
@@ -206,6 +207,7 @@ def load_dataset_from_keypoints(keypoints_dir: str, test_size: float = 0.2,
         keypoints_dir: Keypoint dosyalarının bulunduğu klasör
         test_size: Test set oranı
         random_state: Random seed
+        include_side_videos: Side videoları da dahil et (default: False, sadece front)
         
     Returns:
         train_loader, test_loader: PyTorch DataLoader'lar
@@ -222,7 +224,7 @@ def load_dataset_from_keypoints(keypoints_dir: str, test_size: float = 0.2,
     # Başarılı keypoint'leri filtrele
     successful = [m for m in metadata if m['status'] == 'success']
     
-    # Video yollarından class, view ve person bilgisini çıkar - SADECE FRONT VİDEOLAR
+    # Video yollarından class, view ve person bilgisini çıkar
     keypoint_paths = []
     labels = []
     person_ids = []
@@ -231,15 +233,17 @@ def load_dataset_from_keypoints(keypoints_dir: str, test_size: float = 0.2,
         video_path = item['video_path']
         keypoint_path = item['keypoint_path']
         
-        # FRONT VİDEOLARI KULLAN (eğer front/side ayrımı varsa)
-        # Eğer front/ klasörü yoksa, direkt normal/scoliosis klasöründeki videoları kullan
+        # Front/side yapısını kontrol et
         has_front_structure = '/front/' in video_path.lower() or '\\front\\' in video_path.lower()
         has_side_structure = '/side/' in video_path.lower() or '\\side\\' in video_path.lower()
         
-        # Eğer side/ klasörü varsa ama front/ yoksa, side videoları atla
-        # Eğer hiç front/side yapısı yoksa, tüm videoları kullan
-        if has_side_structure and not has_front_structure:
-            continue  # Side videoları atla (sadece front/side yapısı varsa)
+        # Side videoları dahil etme kontrolü
+        if not include_side_videos:
+            # Sadece front videoları kullan (eğer front/side yapısı varsa)
+            # Eğer side/ klasörü varsa ama front/ yoksa, side videoları atla
+            if has_side_structure and not has_front_structure:
+                continue  # Side videoları atla
+        # include_side_videos=True ise tüm videoları kullan (front + side)
         
         # Class belirle (normal/scoliosis)
         if 'normal' in video_path.lower():
@@ -311,11 +315,13 @@ def load_dataset_from_keypoints(keypoints_dir: str, test_size: float = 0.2,
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
     
-    print(f"📊 Dataset yüklendi (SADECE FRONT VİDEOLAR):")
+    view_type = "FRONT + SIDE VİDEOLAR" if include_side_videos else "SADECE FRONT VİDEOLAR"
+    print(f"📊 Dataset yüklendi ({view_type}):")
     print(f"  Train: {len(X_train)} örnek (Normal: {y_train.count(0)}, Scoliosis: {y_train.count(1)})")
     print(f"  Test: {len(X_test)} örnek (Normal: {y_test.count(0)}, Scoliosis: {y_test.count(1)})")
     print(f"  Toplam: {len(labels)} örnek (Normal: {labels.count(0)}, Scoliosis: {labels.count(1)})")
     print(f"  Person-based split: {'Aktif ✅' if person_based_split else 'Kapalı ❌'}")
     print(f"  Augmentation: {'Aktif ✅' if augment else 'Kapalı ❌'}")
+    print(f"  Side videolar: {'Dahil ✅' if include_side_videos else 'Hariç ❌'}")
     
     return train_loader, test_loader

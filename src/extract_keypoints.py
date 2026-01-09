@@ -209,13 +209,21 @@ def find_all_videos(dataset_root: str) -> Dict[str, list]:
     supported_formats = ['.avi', '.mp4', '.mov', '.mkv', '.wmv', '.flv']
     
     for class_name in ['normal', 'scoliosis']:
-        # Önce eski yapıyı kontrol et (normal/front/)
+        # Front videoları kontrol et
         front_dir = os.path.join(dataset_root, class_name, 'front')
         if os.path.exists(front_dir):
             for ext in supported_formats:
                 pattern = os.path.join(front_dir, f"*{ext}")
                 videos = glob.glob(pattern)
                 video_dict[class_name]['front'].extend(videos)
+        
+        # Side videoları kontrol et
+        side_dir = os.path.join(dataset_root, class_name, 'side')
+        if os.path.exists(side_dir):
+            for ext in supported_formats:
+                pattern = os.path.join(side_dir, f"*{ext}")
+                videos = glob.glob(pattern)
+                video_dict[class_name]['side'].extend(videos)
         
         # Eğer front/ klasörü yoksa, direkt normal/ klasörünü kontrol et (yeni yapı)
         if len(video_dict[class_name]['front']) == 0:
@@ -248,10 +256,11 @@ def main():
     print("🔍 Video dosyaları aranıyor...")
     video_dict = find_all_videos(args.dataset_root)
     
-    # Tüm videoları topla - SADECE FRONT VİDEOLAR
+    # Tüm videoları topla - FRONT + SIDE VİDEOLAR
     all_videos = []
     for class_name in ['normal', 'scoliosis']:
-        all_videos.extend(video_dict[class_name]['front'])  # Sadece front videolar
+        all_videos.extend(video_dict[class_name]['front'])  # Front videolar
+        all_videos.extend(video_dict[class_name]['side'])  # Side videolar da dahil
     
     print(f"📹 Toplam {len(all_videos)} video bulundu")
     print(f"  Normal - Front: {len(video_dict['normal']['front'])}")

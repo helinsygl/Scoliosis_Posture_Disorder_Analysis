@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Skolyoz Analizi Web UI
-Video yükleyip keypoint'leri görüntüleyin ve model ile skolyoz analizi yapın
+Scoliosis Analysis System
+Professional AI-powered posture analysis tool.
 """
 
 import gradio as gr
@@ -13,633 +13,553 @@ import tempfile
 import torch
 import sys
 from pathlib import Path
+import shutil
+import time
 
-# Proje modüllerini import et
+# Import project modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.model import build_model
 from src.extract_keypoints import PoseExtractor
 from src.utils import load_checkpoint
 
-# MediaPipe setup
-mp_pose = mp.solutions.pose
+# --- Configuration ---
+class Config:
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    SAVED_MODELS_DIR = os.path.join(PROJECT_ROOT, "saved_models")
+    SAVED_VIDEOS_DIR = os.path.join(PROJECT_ROOT, "saved_videos")
+    
+    # Visual Styles
+    COLOR_PRIMARY = "#4F46E5"  # Indigo-600
+    COLOR_SECONDARY = "#EC4899" # Pink-500
+    COLOR_SUCCESS = "#10B981"  # Emerald-500
+    COLOR_WARNING = "#F59E0B"  # Amber-500
+    COLOR_DANGER = "#EF4444"   # Red-500
+    
+    # Video
+    CONFIDENCE_THRESHOLD = 0.5
+    PREDICTION_CONFIDENCE_THRESHOLD = 65.0
 
-# Global değişkenler
-model = None
-extractor = None
-device = None
+# --- Core Logic ---
+class ScoliosisAnalyzer:
+    def __init__(self):
+        self.model = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.mp_pose = mp.solutions.pose
+        self.loaded_model_name = None
+        
+        # Ensure directories exist
+        os.makedirs(Config.SAVED_VIDEOS_DIR, exist_ok=True)
+        
+    def get_available_models(self):
+        """Scans the saved_models directory for .pth files."""
+        if not os.path.exists(Config.SAVED_MODELS_DIR):
+            return []
+        
+        models = []
+        for f in os.listdir(Config.SAVED_MODELS_DIR):
+            if f.endswith(".pth"):
+                models.append(f)
+        return sorted(models)
 
-# Proje root dizinini bul
-def get_project_root():
-    """Proje root dizinini bul"""
-    current_file = os.path.abspath(__file__)
-    # src/visualize_gui.py -> proje root
-    project_root = os.path.dirname(os.path.dirname(current_file))
-    return project_root
-
-# En iyi modeli otomatik yükle
-def auto_load_best_model():
-    """En iyi modeli otomatik yükle (dataset_improved.pth)"""
-    global model, extractor, device
-    
-    # Proje root dizinini bul
-    project_root = get_project_root()
-    model_path = os.path.join(project_root, "saved_models", "dataset_improved.pth")
-    
-    # Alternatif path'leri dene
-    possible_paths = [
-        model_path,  # Proje root'tan
-        "saved_models/dataset_improved.pth",  # Mevcut dizinden
-        os.path.join(os.getcwd(), "saved_models", "dataset_improved.pth"),  # Çalışma dizininden
-    ]
-    
-    model_path = None
-    for path in possible_paths:
-        if os.path.exists(path):
-            model_path = path
-            break
-    
-    if model_path is None:
-        # Tüm modelleri listele
-        saved_models_dir = os.path.join(project_root, "saved_models")
-        available_models = []
-        if os.path.exists(saved_models_dir):
-            available_models = [f for f in os.listdir(saved_models_dir) if f.endswith('.pth')]
-        
-        models_list = "\n".join([f"  - {m}" for m in available_models]) if available_models else "  (none found)"
-        return False, f"❌ Best model not found!\n\nSearched paths:\n  - {os.path.join(project_root, 'saved_models', 'dataset_improved.pth')}\n  - saved_models/dataset_improved.pth\n  - {os.path.join(os.getcwd(), 'saved_models', 'dataset_improved.pth')}\n\nAvailable models in saved_models/:\n{models_list}\n\nCurrent directory: {os.getcwd()}\nProject root: {project_root}"
-    
-    try:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # AdvancedLSTM with attention
-        model = build_model(model_type="advanced_lstm", use_attention=True)
-        model = model.to(device)
-        load_checkpoint(model_path, model)
-        model.eval()
-        
-        extractor = PoseExtractor()
-        
-        gpu_info = f"GPU: {torch.cuda.get_device_name(0)}" if torch.cuda.is_available() else "CPU"
-        return True, f"✅ Best model loaded automatically!\n🧠 Model: dataset_improved (81.82% accuracy)\n📁 Path: {model_path}\n📱 Device: {gpu_info}"
-    except Exception as e:
-        return False, f"❌ Model loading error: {str(e)}\n\nTried path: {model_path}"
-
-
-def draw_keypoints_on_frame(frame, keypoint_coords):
-    """Keypoint'leri frame üzerine çizer"""
-    annotated_frame = frame.copy()
-    
-    # MediaPipe POSE_CONNECTIONS
-    connections = [
-        (0, 1), (1, 2), (2, 3), (3, 7),  # Yüz
-        (0, 4), (4, 5), (5, 6), (6, 8),  # Yüz
-        (9, 10),  # Ağız
-        (11, 12),  # Omuzlar
-        (11, 13), (13, 15),  # Sol kol
-        (12, 14), (14, 16),  # Sağ kol
-        (15, 17), (15, 19), (15, 21),  # Sol el
-        (16, 18), (16, 20), (16, 22),  # Sağ el
-        (11, 23), (12, 24),  # Omuz-kalça
-        (23, 24),  # Kalçalar
-        (23, 25), (25, 27),  # Sol bacak
-        (24, 26), (26, 28),  # Sağ bacak
-        (27, 29), (27, 31),  # Sol ayak
-        (28, 30), (28, 32),  # Sağ ayak
-    ]
-    
-    # Bağlantıları çiz
-    for start_idx, end_idx in connections:
-        if start_idx < len(keypoint_coords) and end_idx < len(keypoint_coords):
-            start_vis = keypoint_coords[start_idx][2] if len(keypoint_coords[start_idx]) > 2 else 1.0
-            end_vis = keypoint_coords[end_idx][2] if len(keypoint_coords[end_idx]) > 2 else 1.0
-            
-            if start_vis > 0.5 and end_vis > 0.5:
-                start_point = (keypoint_coords[start_idx][0], keypoint_coords[start_idx][1])
-                end_point = (keypoint_coords[end_idx][0], keypoint_coords[end_idx][1])
-                cv2.line(annotated_frame, start_point, end_point, (0, 255, 0), 2)
-    
-    # Keypoint noktalarını çiz
-    for coord in keypoint_coords:
-        if len(coord) >= 2:
-            x, y = coord[0], coord[1]
-            vis = coord[2] if len(coord) > 2 else 1.0
-            if vis > 0.5:
-                cv2.circle(annotated_frame, (x, y), 4, (0, 0, 255), -1)
-    
-    return annotated_frame
-
-
-def load_model(model_path, model_type="advanced_lstm"):
-    """Load model"""
-    global model, extractor, device
-    
-    if not model_path:
-        return "⚠️ Please select a model file!"
-    
-    try:
-        model_file = model_path.name if hasattr(model_path, 'name') else model_path
-        
-        if not os.path.exists(model_file):
-            return f"❌ Model file not found: {model_file}"
-        
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Try loading with selected model type
+    def load_model(self, model_filename):
+        """
+        Smart Loads a specific model.
+        inspects the checkpoint to determine architecture parameters.
+        """
         try:
-            model = build_model(model_type=model_type)
-            model = model.to(device)
-            load_checkpoint(model_file, model)
+            model_path = os.path.join(Config.SAVED_MODELS_DIR, model_filename)
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(f"Model file not found: {model_path}")
+
+            # 1. Inspect Checkpoint for Architecture
+            checkpoint = torch.load(model_path, map_location='cpu')
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
+            
+            # Detect hidden_dim from lstm.weight_hh_l0
+            # Shape is (4 * hidden_dim, hidden_dim)
+            if 'lstm.weight_hh_l0' in state_dict:
+                weight_shape = state_dict['lstm.weight_hh_l0'].shape
+                hidden_dim = weight_shape[1] 
+                
+                # Detect num_layers
+                num_layers = 0
+                while f'lstm.weight_hh_l{num_layers}' in state_dict:
+                    num_layers += 1
+            else:
+                # Fallback default
+                hidden_dim = 64
+                num_layers = 1
+
+            print(f"🔹 Detected Architecture: Hidden Dim={hidden_dim}, Layers={num_layers}")
+
+            # 2. Re-build Model
+            self.model = build_model(
+                model_type="advanced_lstm", 
+                hidden_dim=hidden_dim, 
+                num_layers=num_layers, 
+                use_attention=True
+            )
+            self.model = self.model.to(self.device)
+            
+            # 3. Load State Dict
+            self.model.load_state_dict(state_dict)
+            self.model.eval()
+            
+            self.loaded_model_name = model_filename
+            return True, f"Successfully loaded '{model_filename}' (Size: {hidden_dim}x{num_layers})"
+            
         except Exception as e:
-            # Try other model types if selected one fails
-            model_types = ["simple_lstm", "advanced_lstm", "hybrid", "transformer", "posture"]
-            loaded = False
-            for mtype in model_types:
-                if mtype != model_type:
-                    try:
-                        model = build_model(model_type=mtype)
-                        model = model.to(device)
-                        load_checkpoint(model_file, model)
-                        model_type = mtype  # Update to the working type
-                        loaded = True
-                        break
-                    except:
-                        continue
-            
-            if not loaded:
-                return f"❌ Model loading error: Could not load with any model type. Error: {str(e)}"
-        
-        model.eval()
-        extractor = PoseExtractor()
-        
-        gpu_info = f"GPU: {torch.cuda.get_device_name(0)}" if torch.cuda.is_available() else "CPU"
-        return f"✅ Model loaded successfully!\n🧠 Model type: {model_type}\n📱 {gpu_info}"
-    except Exception as e:
-        return f"❌ Model loading error: {str(e)}"
+            import traceback
+            traceback.print_exc()
+            return False, f"Failed to load model: {str(e)}"
 
+    def draw_keypoints(self, frame, keypoint_coords):
+        """Draws professional-looking keypoints and skeletons."""
+        annotated_frame = frame.copy()
+        
+        # Connections mapped for visualization
+        connections = [
+            (0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8),
+            (9, 10), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
+            (15, 17), (15, 19), (15, 21), (16, 18), (16, 20), (16, 22),
+            (11, 23), (12, 24), (23, 24), (23, 25), (25, 27), (24, 26), (26, 28),
+            (27, 29), (27, 31), (28, 30), (28, 32),
+        ]
+        
+        # Draw connections
+        for start_idx, end_idx in connections:
+            if start_idx < len(keypoint_coords) and end_idx < len(keypoint_coords):
+                start_pt = keypoint_coords[start_idx]
+                end_pt = keypoint_coords[end_idx]
+                
+                if start_pt[2] > Config.CONFIDENCE_THRESHOLD and end_pt[2] > Config.CONFIDENCE_THRESHOLD:
+                    cv2.line(annotated_frame, (start_pt[0], start_pt[1]), (end_pt[0], end_pt[1]), (255, 255, 255), 2)
 
-def predict_skoliosis(keypoints_array, max_sequence_length=100):
-    """Predict scoliosis from keypoints"""
-    global model, device
-    
-    if model is None:
-        return None, 0, 0, 0, "❌ Model not loaded!"
-    
-    try:
-        # Normalize et (Z-score)
-        keypoints = keypoints_array.copy()
-        for i in range(0, keypoints.shape[1], 3):
-            x_col = keypoints[:, i]
-            y_col = keypoints[:, i+1]
+        # Draw points
+        for coord in keypoint_coords:
+            if coord[2] > Config.CONFIDENCE_THRESHOLD:
+                # Outer circle (White border)
+                cv2.circle(annotated_frame, (coord[0], coord[1]), 5, (255, 255, 255), -1)
+                # Inner circle (Color based on confidence, or fixed)
+                cv2.circle(annotated_frame, (coord[0], coord[1]), 3, (0, 255, 0), -1)
+                
+        return annotated_frame
+
+    def predict(self, keypoints_array, max_sequence_length=100):
+        """Runs the prediction on the extracted keypoints sequence."""
+        if self.model is None:
+            return None
+        
+        try:
+            # Normalization logic
+            keypoints = keypoints_array.copy()
+            for i in range(0, keypoints.shape[1], 3):
+                x_col = keypoints[:, i]
+                y_col = keypoints[:, i+1]
+                
+                if x_col.std() > 1e-8:
+                    keypoints[:, i] = (x_col - x_col.mean()) / (x_col.std() + 1e-8)
+                else:
+                    keypoints[:, i] = x_col - x_col.mean()
+                
+                if y_col.std() > 1e-8:
+                    keypoints[:, i+1] = (y_col - y_col.mean()) / (y_col.std() + 1e-8)
+                else:
+                    keypoints[:, i+1] = y_col - y_col.mean()
             
-            if x_col.std() > 1e-8:
-                keypoints[:, i] = (x_col - x_col.mean()) / (x_col.std() + 1e-8)
-            else:
-                keypoints[:, i] = x_col - x_col.mean()
+            # Padding/Truncating
+            if len(keypoints) > max_sequence_length:
+                keypoints = keypoints[:max_sequence_length]
+            elif len(keypoints) < max_sequence_length:
+                padding = np.zeros((max_sequence_length - len(keypoints), keypoints.shape[1]))
+                keypoints = np.vstack([keypoints, padding])
             
-            if y_col.std() > 1e-8:
-                keypoints[:, i+1] = (y_col - y_col.mean()) / (y_col.std() + 1e-8)
-            else:
-                keypoints[:, i+1] = y_col - y_col.mean()
-        
-        # Sequence uzunluğunu sınırla
-        if len(keypoints) > max_sequence_length:
-            keypoints = keypoints[:max_sequence_length]
-        
-        # Padding ekle
-        if len(keypoints) < max_sequence_length:
-            padding_length = max_sequence_length - len(keypoints)
-            padding = np.zeros((padding_length, keypoints.shape[1]))
-            keypoints = np.vstack([keypoints, padding])
-        
-        # Tensor'a çevir
-        keypoints_tensor = torch.FloatTensor(keypoints).unsqueeze(0).to(device)
-        
-        # Tahmin
-        with torch.no_grad():
-            output = model(keypoints_tensor)
-            probabilities = torch.softmax(output, dim=1)
-            prediction = output.argmax(dim=1).item()
-        
-        # Sonuçları hazırla
-        normal_prob = float(probabilities[0][0].item()) * 100
-        scoliosis_prob = float(probabilities[0][1].item()) * 100
-        
-        # Güven eşiği kontrolü - %65 altındaysa belirsiz
-        confidence_threshold = 65.0
-        
-        if max(normal_prob, scoliosis_prob) < confidence_threshold:
-            result = "Uncertain ⚠️"
+            # Inference
+            keypoints_tensor = torch.FloatTensor(keypoints).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                output = self.model(keypoints_tensor)
+                probabilities = torch.softmax(output, dim=1)
+                prediction = output.argmax(dim=1).item()
+            
+            normal_prob = float(probabilities[0][0].item()) * 100
+            scoliosis_prob = float(probabilities[0][1].item()) * 100
+            
             confidence = max(normal_prob, scoliosis_prob)
-        else:
-            result = "Normal" if prediction == 0 else "Scoliosis"
-            confidence = normal_prob if prediction == 0 else scoliosis_prob
-        
-        return result, confidence, normal_prob, scoliosis_prob, "✅ Prediction completed!"
-        
-    except Exception as e:
-        return None, 0, 0, 0, f"❌ Prediction error: {str(e)}"
+            is_uncertain = confidence < Config.PREDICTION_CONFIDENCE_THRESHOLD
+            
+            return {
+                "prediction": "Normal" if prediction == 0 else "Scoliosis",
+                "normal_prob": normal_prob,
+                "scoliosis_prob": scoliosis_prob,
+                "confidence": confidence,
+                "is_uncertain": is_uncertain
+            }
+            
+        except Exception as e:
+            print(f"Prediction error: {e}")
+            return None
 
+    def process_video(self, video_path, progress_callback=None):
+        """Processes the video: extracts keypoints, renders visual, runs prediction."""
+        if not video_path:
+            raise ValueError("No video provided")
+            
+        if self.model is None:
+            raise ValueError("No model loaded. Please select and load a model first.")
 
-def process_video(video_file):
-    """Process video, draw keypoints and make prediction"""
-    global model
-    
-    if video_file is None:
-        return None, "", "⚠️ Please upload a video file!"
-    
-    # Model yüklü mü kontrol et
-    if model is None:
-        success, msg = auto_load_best_model()
-        if not success:
-            return None, "", f"❌ {msg}\n\nPlease ensure saved_models/dataset_improved.pth exists."
-    
-    try:
-        # Gradio file upload formatını handle et
-        if isinstance(video_file, str):
-            video_path = video_file
-        elif hasattr(video_file, 'name'):
-            video_path = video_file.name
-        elif isinstance(video_file, dict) and 'name' in video_file:
-            video_path = video_file['name']
-        else:
-            video_path = str(video_file)
-        
-        if not os.path.exists(video_path):
-            return None, "", f"❌ Video file not found: {video_path}"
-        
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
-            return None, "", f"❌ Video could not be opened: {video_path}"
+            raise ValueError("Could not open video file.")
+
+        # Video properties
+        original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = int(cap.get(cv2.CAP_PROP_FPS) or 30)
         
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps <= 0 or fps != fps:  # NaN kontrolü
-            fps = 30.0  # Varsayılan FPS
-        fps = int(fps)
-        
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # Resize for performance (Max height 640p)
+        max_height = 640
+        if original_height > max_height:
+            scale = max_height / original_height
+            width = int(original_width * scale)
+            height = max_height
+            print(f"Resizing video from {original_width}x{original_height} to {width}x{height} for speed.")
+        else:
+            width = original_width
+            height = original_height
+
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # Try VP8 (WebM) first for better browser support without ffmpeg, then mp4v
+        codecs = ['vp80', 'mp4v', 'avc1'] 
+        out = None
+        current_codec = ""
         
-        if width <= 0 or height <= 0:
-            return None, "", f"❌ Invalid video dimensions: {width}x{height}"
-        
-        # Keypoint'leri canlı olarak çıkar
-        all_keypoints_list = []
-        
-        pose = mp_pose.Pose(
+        for codec in codecs:
+            try:
+                # VP8 needs .webm extension usually, but .mp4 container might accept it in cv2 depending on backend
+                # Safest for browser is .webm for vp80
+                ext = '.webm' if codec == 'vp80' else '.mp4'
+                
+                # We need to recreate temp file with correct extension
+                if 'temp_output' in locals() and os.path.exists(temp_output):
+                    try: os.unlink(temp_output)
+                    except: pass
+                temp_output = tempfile.NamedTemporaryFile(suffix=ext, delete=False).name
+                
+                fourcc = cv2.VideoWriter_fourcc(*codec)
+                out = cv2.VideoWriter(temp_output, fourcc, fps, (width, height))
+                if out.isOpened():
+                    print(f"Initialized video writer with codec: {codec}")
+                    current_codec = codec
+                    break
+            except Exception as e:
+                print(f"Codec {codec} failed: {e}")
+                continue
+                
+        if not out or not out.isOpened():
+             raise ValueError("Could not initialize video writer with any supported codec.")
+
+        pose = self.mp_pose.Pose(
             static_image_mode=False,
             model_complexity=1,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5
         )
-        
-        # Çıkış video - kalıcı klasöre kaydet
-        project_root = get_project_root()
-        saved_videos_dir = os.path.join(project_root, "saved_videos")
-        os.makedirs(saved_videos_dir, exist_ok=True)
-        
-        # Benzersiz dosya adı oluştur
-        import time
-        timestamp = int(time.time())
-        video_name = f"analysis_{timestamp}_{os.getpid()}.mp4"
-        output_path = os.path.join(saved_videos_dir, video_name)
-        
-        # Video codec'leri sırayla dene
-        codecs_to_try = [
-            ('avc1', 'H.264'),
-            ('mp4v', 'MPEG-4'),
-            ('XVID', 'XVID'),
-            ('MJPG', 'Motion JPEG')
-        ]
-        
-        out = None
-        used_codec = None
-        for codec_name, codec_desc in codecs_to_try:
-            try:
-                fourcc = cv2.VideoWriter_fourcc(*codec_name)
-                out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-                if out.isOpened():
-                    used_codec = codec_desc
-                    break
-                else:
-                    out.release()
-            except:
-                continue
-        
-        if out is None or not out.isOpened():
-            return None, "", f"❌ Video codec could not be opened! Tried: {', '.join([c[1] for c in codecs_to_try])}"
-        
-        frame_count = 0
+
+        all_keypoints_list = []
         detected_frames = 0
-        
-        while cap.isOpened():
+        frame_idx = 0
+
+        while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            
-            annotated_frame = frame.copy()
-            has_pose = False
-            keypoint_coords = []
-            frame_keypoints = []
-            
-            # Canlı keypoint çıkarımı
+                
+            # Process Frame
+            if width != original_width or height != original_height:
+                frame = cv2.resize(frame, (width, height))
+                
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(rgb_frame)
             
+            annotated_frame = frame.copy()
+            frame_keypoints = [0.0] * 99
+            
             if results.pose_landmarks:
-                has_pose = True
                 detected_frames += 1
+                keypoint_coords = []
+                frame_keypoints = []
                 
                 for landmark in results.pose_landmarks.landmark:
-                    x_pixel = int(landmark.x * width)
-                    y_pixel = int(landmark.y * height)
-                    keypoint_coords.append((x_pixel, y_pixel, landmark.visibility))
+                    # Visual coords
+                    x_px = int(landmark.x * width)
+                    y_px = int(landmark.y * height)
+                    keypoint_coords.append((x_px, y_px, landmark.visibility))
+                    # Data coords
                     frame_keypoints.extend([landmark.x, landmark.y, landmark.visibility])
                 
-                annotated_frame = draw_keypoints_on_frame(annotated_frame, keypoint_coords)
-            else:
-                frame_keypoints = [0.0] * 99
+                annotated_frame = self.draw_keypoints(annotated_frame, keypoint_coords)
             
             all_keypoints_list.append(frame_keypoints)
             
-            color = (0, 255, 0) if has_pose else (0, 0, 255)
-            text = "POSE DETECTED" if has_pose else "NO POSE"
-            cv2.putText(annotated_frame, f"Frame: {frame_count}/{total_frames}", 
-                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            cv2.putText(annotated_frame, text, 
-                       (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            # Overlay Info: Only draw if NOT using webm/vp80 to avoid encoding issues? 
+            # Actually cv2 should handle text fine.
+            cv2.putText(annotated_frame, f"Analysis Mode | Frame: {frame_idx}", (20, 40), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             
             out.write(annotated_frame)
-            frame_count += 1
-        
+            frame_idx += 1
+            
+            if progress_callback and frame_idx % 10 == 0:
+                progress_callback(frame_idx, total_frames)
+
         cap.release()
-        if out:
-            out.release()
-        if pose:
-            pose.close()
+        out.release()
+        pose.close()
+
+        # Save Final Video
+        ext = '.webm' if current_codec == 'vp80' else '.mp4'
+        final_video_name = f"analysis_{int(time.time())}{ext}"
+        final_path = os.path.join(Config.SAVED_VIDEOS_DIR, final_video_name)
+        shutil.copy2(temp_output, final_path)
+        os.unlink(temp_output)
         
-        # Video dosyasının oluşturulduğundan emin ol
-        import time
-        max_wait = 10  # Maksimum 10 saniye bekle
-        wait_time = 0
-        while not os.path.exists(output_path) and wait_time < max_wait:
-            time.sleep(0.2)
-            wait_time += 0.2
+        # Run Prediction
+        keypoints_array = np.array(all_keypoints_list)
+        result = self.predict(keypoints_array)
         
-        if not os.path.exists(output_path):
-            return None, "", f"❌ Video file could not be created: {output_path}"
+        return final_path, result, {
+            "total_frames": frame_idx,
+            "detected_frames": detected_frames,
+            "detection_rate": (detected_frames/frame_idx)*100 if frame_idx > 0 else 0
+        }
+
+# --- UI Logic & Events ---
+analyzer = ScoliosisAnalyzer()
+
+def go_to_analysis(model_name):
+    if not model_name:
+        return gr.update(), gr.update(), "⚠️ Please select a model first."
+    
+    success, msg = analyzer.load_model(model_name)
+    if not success:
+        return gr.update(), gr.update(), f"❌ {msg}"
+    
+    # Return: (visible=False for step 1), (visible=True for step 2), (info update)
+    return gr.update(visible=False), gr.update(visible=True), ""
+
+def go_back():
+    return gr.update(visible=True), gr.update(visible=False)
+
+def ui_video_change(video):
+    if video is None:
+        return "Waiting for video..."
+    return "✅ Video Uploaded. Ready to Analyze."
+
+def ui_video_clear():
+    return None, "", "Waiting for video...", None
+
+def ui_process_video(video, progress=gr.Progress()):
+    if video is None:
+        return None, "", "Please upload a video first."
+    
+    if analyzer.model is None:
+        return None, "", "Error: Model detached. Please go back and reload."
+            
+    progress(0, desc="Initializing...")
+    
+    def update_progress(current, total):
+        progress(current/total, desc=f"Processing Frame {current}/{total}")
         
-        # Dosyanın tamamen yazıldığından emin ol (dosya boyutu sabit kalana kadar bekle)
-        prev_size = 0
-        stable_count = 0
-        for _ in range(20):  # Maksimum 2 saniye bekle
-            time.sleep(0.1)
-            if os.path.exists(output_path):
-                current_size = os.path.getsize(output_path)
-                if current_size == prev_size and current_size > 0:
-                    stable_count += 1
-                    if stable_count >= 3:  # 3 kez aynı boyutta ise tamamlanmış demektir
-                        break
-                else:
-                    stable_count = 0
-                prev_size = current_size
+    try:
+        vid_path = video if isinstance(video, str) else video.name
+        output_path, result, stats = analyzer.process_video(vid_path, update_progress)
         
-        # Mutlak path'e çevir (Gradio için gerekli)
-        output_path = os.path.abspath(output_path)
-        
-        # Dosyanın okunabilir olduğundan emin ol
-        if not os.access(output_path, os.R_OK):
-            return None, "", f"❌ Video file is not readable: {output_path}"
-        
-        detection_rate = (detected_frames / frame_count) * 100 if frame_count > 0 else 0
-        
-        # Tahmin yap (her zaman yapılır)
-        prediction_result = ""
-        prediction_label = ""
-        normal_prob = 0
-        scoliosis_prob = 0
-        confidence = 0
-        
-        if model is not None and len(all_keypoints_list) > 0:
-            keypoints_array = np.array(all_keypoints_list)
-            prediction_label, confidence, normal_prob, scoliosis_prob, pred_msg = predict_skoliosis(keypoints_array)
-            prediction_result = "completed"
-        
-        info = f"## ✅ Analysis Completed!\n\n"
-        info += f"### 📹 Video Information\n"
-        info += f"- **Total frames:** {frame_count}\n"
-        info += f"- **Pose detected:** {detected_frames} frames\n"
-        info += f"- **Detection rate:** {detection_rate:.1f}%\n"
-        info += f"- **Video resolution:** {width}x{height}\n"
-        info += f"- **FPS:** {fps}\n\n"
-        
-        if prediction_result == "completed" and prediction_label:
-            info += f"### 🎯 AI Analysis Result\n"
-            info += f"- **Prediction:** **{prediction_label}**\n"
-            info += f"- **Confidence:** {confidence:.1f}%\n"
-            info += f"- **Normal probability:** {normal_prob:.1f}%\n"
-            info += f"- **Scoliosis probability:** {scoliosis_prob:.1f}%\n"
-            info += f"\n### 📊 Model Information\n"
-            info += f"- **Model:** dataset_improved (Best Model)\n"
-            info += f"- **Accuracy:** 81.82%\n"
-            info += f"- **Precision:** 86.36%\n"
-            info += f"- **Recall:** 81.82%\n"
-        
-        # HTML format prediction result
-        prediction_html = ""
-        if prediction_result == "completed" and prediction_label:
-            if "Uncertain" in prediction_label:
-                prediction_html = f"""
-                <div style="background: linear-gradient(135deg, #fff3cd 0%, #ffeaa7 100%); color: #856404; padding: 25px; border-radius: 12px; border: 3px solid #ffc107; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
-                    <div style="font-size: 3em; margin-bottom: 15px;">⚠️</div>
-                    <h2 style="margin: 0 0 15px 0; font-size: 1.8em; font-weight: bold;">Uncertain Result</h2>
-                    <p style="margin: 10px 0; font-size: 1.1em;"><strong>Confidence Level:</strong> {confidence:.1f}%</p>
-                    <div style="display: flex; justify-content: space-around; margin: 20px 0; padding: 15px; background: rgba(255,255,255,0.3); border-radius: 8px;">
-                        <div>
-                            <p style="margin: 5px 0; font-size: 0.9em; opacity: 0.8;">Normal</p>
-                            <p style="margin: 5px 0; font-size: 1.5em; font-weight: bold;">{normal_prob:.1f}%</p>
-                        </div>
-                        <div>
-                            <p style="margin: 5px 0; font-size: 0.9em; opacity: 0.8;">Scoliosis</p>
-                            <p style="margin: 5px 0; font-size: 1.5em; font-weight: bold;">{scoliosis_prob:.1f}%</p>
-                        </div>
-                    </div>
-                    <p style="margin: 15px 0 0 0; font-size: 0.95em; font-style: italic;">Model confidence is too low. Please try with a clearer video.</p>
+        # Generate HTML Report
+        if result is None:
+            html = """<div class="result-card error">Analysis Failed. Maybe video has no people?</div>"""
+        else:
+            result_color = Config.COLOR_SUCCESS if result['prediction'] == 'Normal' else Config.COLOR_DANGER
+            if result['is_uncertain']: result_color = Config.COLOR_WARNING
+                
+            html = f"""
+            <div style="background-color: white; border-radius: 1rem; padding: 2rem; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); text-align: center; border: 2px solid {result_color}20;">
+                <div style="color: {result_color}; font-size: 3.5rem; margin-bottom: 0.5rem; line-height: 1;">
+                    {result['prediction']}
                 </div>
-                """
-            elif prediction_label == "Normal":
-                prediction_html = f"""
-                <div style="background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%); color: #155724; padding: 25px; border-radius: 12px; border: 3px solid #28a745; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
-                    <div style="font-size: 3em; margin-bottom: 15px;">✅</div>
-                    <h2 style="margin: 0 0 15px 0; font-size: 1.8em; font-weight: bold;">Normal Posture</h2>
-                    <p style="margin: 10px 0; font-size: 1.1em;"><strong>Confidence:</strong> {confidence:.1f}%</p>
-                    <div style="display: flex; justify-content: space-around; margin: 20px 0; padding: 15px; background: rgba(255,255,255,0.3); border-radius: 8px;">
-                        <div>
-                            <p style="margin: 5px 0; font-size: 0.9em; opacity: 0.8;">Normal</p>
-                            <p style="margin: 5px 0; font-size: 1.5em; font-weight: bold;">{normal_prob:.1f}%</p>
-                        </div>
-                        <div>
-                            <p style="margin: 5px 0; font-size: 0.9em; opacity: 0.8;">Scoliosis</p>
-                            <p style="margin: 5px 0; font-size: 1.5em; font-weight: bold;">{scoliosis_prob:.1f}%</p>
-                        </div>
-                    </div>
-                    <p style="margin: 15px 0 0 0; font-size: 0.95em; color: #155724;">No signs of scoliosis detected in the analysis.</p>
+                <div style="color: #6b7280; font-size: 1.1rem; margin-bottom: 2rem;">
+                     Confidence: <strong>{result['confidence']:.1f}%</strong>
                 </div>
-                """
-            else:
-                prediction_html = f"""
-                <div style="background: linear-gradient(135deg, #f8d7da 0%, #f5c6cb 100%); color: #721c24; padding: 25px; border-radius: 12px; border: 3px solid #dc3545; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
-                    <div style="font-size: 3em; margin-bottom: 15px;">⚠️</div>
-                    <h2 style="margin: 0 0 15px 0; font-size: 1.8em; font-weight: bold;">Scoliosis Detected</h2>
-                    <p style="margin: 10px 0; font-size: 1.1em;"><strong>Confidence:</strong> {confidence:.1f}%</p>
-                    <div style="display: flex; justify-content: space-around; margin: 20px 0; padding: 15px; background: rgba(255,255,255,0.3); border-radius: 8px;">
-                        <div>
-                            <p style="margin: 5px 0; font-size: 0.9em; opacity: 0.8;">Normal</p>
-                            <p style="margin: 5px 0; font-size: 1.5em; font-weight: bold;">{normal_prob:.1f}%</p>
-                        </div>
-                        <div>
-                            <p style="margin: 5px 0; font-size: 0.9em; opacity: 0.8;">Scoliosis</p>
-                            <p style="margin: 5px 0; font-size: 1.5em; font-weight: bold;">{scoliosis_prob:.1f}%</p>
-                        </div>
+                
+                <div style="display: flex; gap: 1rem; justify-content: center;">
+                    <div style="background-color: {Config.COLOR_SUCCESS}15; padding: 1rem; border-radius: 0.75rem; min-width: 120px;">
+                        <div style="font-size: 0.8rem; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em;">Normal</div>
+                        <div style="font-size: 1.5rem; font-weight: 700; color: {Config.COLOR_SUCCESS};">{result['normal_prob']:.1f}%</div>
                     </div>
-                    <p style="margin: 15px 0 0 0; font-size: 0.95em; color: #721c24; font-weight: bold;">⚠️ Please consult with a medical professional for proper diagnosis.</p>
+                    <div style="background-color: {Config.COLOR_DANGER}15; padding: 1rem; border-radius: 0.75rem; min-width: 120px;">
+                        <div style="font-size: 0.8rem; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em;">Scoliosis</div>
+                        <div style="font-size: 1.5rem; font-weight: 700; color: {Config.COLOR_DANGER};">{result['scoliosis_prob']:.1f}%</div>
+                    </div>
                 </div>
-                """
+                
+                {'<div style="margin-top: 1.5rem; padding: 0.75rem; background-color: #fffbeb; color: #b45309; border-radius: 0.5rem; font-size: 0.85rem; display: inline-block;">⚠️ Low Confidence Result</div>' if result['is_uncertain'] else ''}
+            </div>
+            """
+
+        stats_md = f"""
+        ### 📊 Analysis Statistics
+        - **Total Frames**: {stats['total_frames']}
+        - **Pose Detected**: {stats['detected_frames']} frames ({stats['detection_rate']:.1f}%)
+        """
         
-        # Video path'in mutlak path olduğundan ve dosyanın var olduğundan emin ol
-        if not os.path.isabs(output_path):
-            output_path = os.path.abspath(output_path)
-        
-        # Dosya boyutunu kontrol et (boş dosya olmamalı)
-        file_size = os.path.getsize(output_path)
-        if file_size == 0:
-            return None, "", "❌ Video file is empty!"
-        
-        return output_path, prediction_html, info
+        return output_path, html, stats_md
         
     except Exception as e:
         import traceback
-        error_details = traceback.format_exc()
-        error_msg = f"❌ Error occurred during video processing:\n\n{str(e)}\n\nDetails:\n{error_details}"
-        print(f"ERROR in process_video: {error_msg}")  # Console'a da yazdır
-        return None, "", error_msg
+        traceback.print_exc()
+        return None, f"<div style='color:red; padding:1rem;'>Error: {str(e)}</div>", ""
 
+# --- Custom CSS ---
+custom_css = """
+body { font-family: 'Inter', system-ui, sans-serif; background-color: #f8fafc; }
+.container { max-width: 1100px; margin: 0 auto; padding: 2rem; }
+.header { text-align: center; margin-bottom: 3rem; }
+.header h1 { font-size: 2.5rem; font-weight: 800; background: linear-gradient(135deg, #4F46E5 0%, #EC4899 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 0.5rem; }
+.header p { color: #64748b; font-size: 1.1rem; }
 
-# Gradio UI - Profesyonel tasarım
-with gr.Blocks(title="Scoliosis Analysis System") as demo:
-    gr.HTML("""
-    <div style="text-align: center; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; border-radius: 15px; color: white; margin-bottom: 30px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
-        <h1 style="margin: 0; color: white; font-size: 2.5em; font-weight: bold;">🏥 Scoliosis Analysis System</h1>
-        <p style="margin: 15px 0 0 0; font-size: 1.2em; opacity: 0.95;">AI-Powered Posture Analysis & Scoliosis Detection</p>
-        <p style="margin: 10px 0 0 0; font-size: 0.9em; opacity: 0.85;">Upload video → Extract keypoints → AI analysis → Results</p>
-    </div>
-    """)
+.wizard-card {
+    background: white;
+    padding: 3rem;
+    border-radius: 1.5rem;
+    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+    text-align: center;
+    max-width: 600px;
+    margin: 0 auto;
+}
+
+.primary-btn { 
+    background: linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%) !important; 
+    border: 0 !important; 
+    color: white !important; 
+    font-weight: 600 !important; 
+    font-size: 1.1rem !important;
+    padding: 0.75rem 2rem !important;
+    border-radius: 0.75rem !important;
+    transition: transform 0.2s !important;
+}
+.primary-btn:hover { transform: scale(1.02); }
+
+.secondary-btn {
+    background: #f1f5f9 !important;
+    color: #475569 !important;
+}
+"""
+
+# --- App Layout ---
+with gr.Blocks(title="Scoliosis Analysis AI") as demo:
+    gr.HTML(f"<style>{custom_css}</style>")
     
-    # Model durumu göster
-    model_status_display = gr.HTML()
-    
-    with gr.Row():
-        with gr.Column(scale=1):
-            gr.Markdown("""
-            ### 📤 Upload Video
-            
-            Upload a video file to analyze. The system will:
-            - Extract pose keypoints automatically
-            - Visualize keypoints on video
-            - Perform AI-powered scoliosis analysis
+    with gr.Column(elem_classes="container"):
+        
+        # Header
+        gr.HTML("""
+        <div class="header">
+            <h1>Scoliosis Analysis AI</h1>
+            <p>Professional Posture Assessment System</p>
+        </div>
+        """)
+        
+        # --- Step 1: Model Selection ---
+        with gr.Group(visible=True) as step_1_group:
+            gr.HTML("""
+            <div class="wizard-card">
+                <div style="font-size: 3rem; margin-bottom: 1rem;">🧠</div>
+                <h2 style="font-size: 1.5rem; font-weight: 700; margin-bottom: 2rem; color: #1e293b;">Select AI Model</h2>
             """)
             
-            video_input = gr.File(
-                label="📹 Select Video File",
-                file_types=[".mp4", ".avi", ".mov", ".mkv", ".wmv"],
-                height=100
-            )
+            with gr.Column(scale=1):
+                model_dropdown = gr.Dropdown(
+                    choices=analyzer.get_available_models(),
+                    label="",
+                    show_label=False,
+                    value=analyzer.get_available_models()[0] if analyzer.get_available_models() else None,
+                    interactive=True,
+                    container=False
+                )
+                
+                next_btn = gr.Button("Next ➜", variant="primary", elem_classes="primary-btn")
+                
+                error_box = gr.Markdown("", visible=True)
             
-            process_btn = gr.Button(
-                "🚀 Analyze Video", 
-                variant="primary",
-                size="lg",
-                scale=2
-            )
-        
-        with gr.Column(scale=1):
-            gr.Markdown("### 📺 Analysis Results")
+            gr.HTML("</div>") # Close card
+
+        # --- Step 2: Analysis ---
+        with gr.Group(visible=False) as step_2_group:
+            with gr.Row():
+                back_btn = gr.Button("⬅ Change Model", size="sm", variant="secondary", scale=0)
             
-            video_output = gr.Video(
-                label="📹 Video with Keypoints Visualization",
-                height=400,
-                autoplay=True
-            )
-            
-            prediction_output = gr.HTML(
-                label="🎯 Scoliosis Analysis Result",
-                elem_classes=["prediction-box"]
-            )
-            
-            with gr.Accordion("📊 Detailed Information", open=False):
-                info_output = gr.Markdown()
+            with gr.Row(equal_height=True):
+                # Left: Input
+                with gr.Column(scale=1):
+                    gr.Markdown("### 📹 Upload Video")
+                    input_video = gr.Video(label="Input Video")
+                    analyze_btn = gr.Button("✨ Run Analysis", variant="primary", elem_classes="primary-btn", size="lg")
+                    
+                    gr.Markdown("---")
+                    stats_output = gr.Markdown("Waiting for video...")
+
+                # Right: Output
+                with gr.Column(scale=1):
+                    gr.Markdown("### 🎯 Results")
+                    output_video = gr.Video(label="Processed Output", interactive=False, autoplay=True)
+                    prediction_result = gr.HTML(label="Prediction")
+
+    # --- Event Wiring ---
     
-    gr.Markdown("""
-    ---
-    ### 📝 How to Use
-    
-    1. **Upload Video**: Click "Select Video File" and choose your video
-    2. **Analyze**: Click "Analyze Video" button
-    3. **View Results**: 
-       - Watch the video with keypoints visualized
-       - See the AI analysis result (Normal or Scoliosis)
-       - Check detailed statistics
-    
-    ### 🎯 Analysis Information
-    
-    - **Model**: Best performing model (81.82% accuracy)
-    - **Keypoints**: 33 body keypoints extracted using MediaPipe
-    - **Analysis**: Real-time AI prediction with confidence scores
-    
-    ### ⚠️ Important Notes
-    
-    - Video should show person from front view
-    - Ensure good lighting and clear visibility
-    - Results are for reference only - consult a medical professional for diagnosis
-    """)
-    
-    # Başlangıçta modeli yükle
-    def initialize_model():
-        success, msg = auto_load_best_model()
-        if success:
-            return f"""
-            <div style="background: #d4edda; color: #155724; padding: 15px; border-radius: 8px; border: 2px solid #28a745; margin-bottom: 20px;">
-                <h4 style="margin: 0 0 10px 0;">✅ {msg}</h4>
-            </div>
-            """
-        else:
-            return f"""
-            <div style="background: #f8d7da; color: #721c24; padding: 15px; border-radius: 8px; border: 2px solid #dc3545; margin-bottom: 20px;">
-                <h4 style="margin: 0 0 10px 0;">❌ {msg}</h4>
-            </div>
-            """
-    
-    # Video işleme
-    process_btn.click(
-        fn=process_video,
-        inputs=[video_input],
-        outputs=[video_output, prediction_output, info_output]
+    # Next Button Click
+    next_btn.click(
+        fn=go_to_analysis,
+        inputs=[model_dropdown],
+        outputs=[step_1_group, step_2_group, error_box],
+        show_progress="hidden"
     )
     
-    # Sayfa yüklendiğinde modeli yükle
-    demo.load(
-        fn=initialize_model,
-        outputs=[model_status_display]
+    # Back Button Click
+    back_btn.click(
+        fn=go_back,
+        inputs=[],
+        outputs=[step_1_group, step_2_group],
+        show_progress="hidden"
+    )
+    
+    # Video Upload Events
+    input_video.upload(
+        fn=lambda: "⏳ Loading...",
+        inputs=None,
+        outputs=[stats_output],
+        show_progress="hidden"
+    ).then(
+        fn=ui_video_change,
+        inputs=[input_video],
+        outputs=[stats_output],
+        show_progress="hidden"
+    )
+    
+    # Video Clear Event
+    input_video.clear(
+        fn=ui_video_clear,
+        inputs=[],
+        outputs=[output_video, prediction_result, stats_output, input_video],
+        show_progress="hidden"
     )
 
+    # Analyze Click
+    analyze_btn.click(
+        fn=ui_process_video,
+        inputs=[input_video],
+        outputs=[output_video, prediction_result, stats_output],
+        show_progress="minimal"
+    )
 
 if __name__ == "__main__":
-    print("🌐 Scoliosis Analysis Web UI starting...")
-    print("📱 Will open in browser: http://localhost:7860")
-    print("⏹️  Press Ctrl+C to stop")
-    
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=False
-    )
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)

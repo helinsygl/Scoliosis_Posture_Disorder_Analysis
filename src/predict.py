@@ -168,6 +168,9 @@ def main():
     parser.add_argument("--video_dir", help="Video klasörü (toplu tahmin için)")
     parser.add_argument("--output", help="Sonuç kayıt dosyası (JSON)")
     parser.add_argument("--device", default="cuda", help="Device (cuda/cpu)")
+    parser.add_argument("--hidden_dim", type=int, default=None, help="Hidden dimension (auto-detect from checkpoint if not specified)")
+    parser.add_argument("--num_layers", type=int, default=None, help="Number of LSTM layers (auto-detect from checkpoint if not specified)")
+    parser.add_argument("--dropout", type=float, default=None, help="Dropout rate (auto-detect from checkpoint if not specified)")
     
     args = parser.parse_args()
     
@@ -177,10 +180,47 @@ def main():
     if torch.cuda.is_available():
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
     
-    # Model oluştur ve yükle - Attention mekanizmasını aktif et (eğer advanced_lstm ise)
+    # Model parametrelerini checkpoint'ten otomatik tespit et
+    checkpoint = torch.load(args.model_path, map_location='cpu')
+    state_dict = checkpoint['model_state_dict']
+    
+    # Hidden dimension'ı tespit et (fc.weight veya attention_weights.weight'tan)
+    if args.hidden_dim is None:
+        if 'fc.weight' in state_dict:
+            # fc.weight shape: [num_classes, hidden_dim * (2 if bidirectional else 1)]
+            fc_shape = state_dict['fc.weight'].shape
+            args.hidden_dim = fc_shape[1] // 2  # bidirectional olduğu için 2'ye böl
+        elif 'attention_weights.weight' in state_dict:
+            attn_shape = state_dict['attention_weights.weight'].shape
+            args.hidden_dim = attn_shape[1] // 2
+        else:
+            args.hidden_dim = 64  # default
+    
+    # Num layers'ı tespit et (lstm.weight_ih_l* key'lerinden)
+    if args.num_layers is None:
+        lstm_keys = [k for k in state_dict.keys() if 'lstm.weight_ih_l' in k]
+        if lstm_keys:
+            layer_indices = [int(k.split('_l')[1].split('_')[0]) for k in lstm_keys if '_l' in k]
+            args.num_layers = max(layer_indices) + 1 if layer_indices else 1
+        else:
+            args.num_layers = 1
+    
+    # Dropout'u tespit et (zor, default kullan)
+    if args.dropout is None:
+        args.dropout = 0.3  # default, genelde 0.25-0.3 arası
+    
+    # Model oluştur
     print(f"📂 Model yükleniyor: {args.model_path}")
+    print(f"   Hidden Dim: {args.hidden_dim}, Layers: {args.num_layers}, Dropout: {args.dropout}")
+    
     if args.model_type == "advanced_lstm":
-        model = build_model(model_type=args.model_type, use_attention=True)
+        model = build_model(
+            model_type=args.model_type,
+            hidden_dim=args.hidden_dim,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+            use_attention=True
+        )
     else:
         model = build_model(model_type=args.model_type)
     model = model.to(device)

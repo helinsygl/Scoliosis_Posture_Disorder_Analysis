@@ -35,12 +35,13 @@ def test_seed(seed: int, model_type: str = "advanced_lstm",
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Dataset yükle
+    # Dataset yükle - side videoları dahil et
     train_loader, val_loader = load_dataset_from_keypoints(
         "keypoints",
         augment=True,
         batch_size=batch_size,
-        person_based_split=True
+        person_based_split=True,
+        include_side_videos=True  # Side videoları dahil
     )
     
     # Class weights hesapla
@@ -52,12 +53,20 @@ def test_seed(seed: int, model_type: str = "advanced_lstm",
     scoliosis_count = train_labels.count(1)
     total = normal_count + scoliosis_count
     
-    weight_normal = total / (2 * normal_count) if normal_count > 0 else 1.0
-    weight_scoliosis = total / (2 * scoliosis_count) if scoliosis_count > 0 else 1.0
+    # Geliştirilmiş class weighting - Normal sınıfına daha fazla ağırlık
+    if normal_count > 0 and scoliosis_count > 0:
+        weight_normal = (total / (1.5 * normal_count)) * 3.0  # Agresif weighting
+        weight_scoliosis = total / (2 * scoliosis_count)
+    else:
+        weight_normal = 1.0
+        weight_scoliosis = 1.0
     class_weights = [weight_normal, weight_scoliosis]
     
-    # Model oluştur
-    model = build_model(model_type=model_type)
+    # Model oluştur - Attention aktif
+    if model_type == "advanced_lstm":
+        model = build_model(model_type=model_type, use_attention=True)
+    else:
+        model = build_model(model_type=model_type)
     model = model.to(device)
     
     # Model adı (seed ile)
@@ -83,7 +92,8 @@ def test_seed(seed: int, model_type: str = "advanced_lstm",
         "keypoints",
         augment=False,
         batch_size=batch_size,
-        person_based_split=True
+        person_based_split=True,
+        include_side_videos=True  # Side videoları dahil
     )
     
     # Model'i yükle
@@ -92,7 +102,7 @@ def test_seed(seed: int, model_type: str = "advanced_lstm",
     load_checkpoint(model_path, model)
     
     # Değerlendir
-    y_true, y_pred, y_probs = evaluate(model, test_loader, device)
+    y_true, y_pred, y_probs, _ = evaluate(model, test_loader, device, test_dataset=None)
     metrics = calculate_metrics(y_true, y_pred)
     
     test_accuracy = metrics['accuracy']

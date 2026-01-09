@@ -1,12 +1,25 @@
-torch>=1.9.0
-torchvision>=0.10.0
-opencv-python>=4.5.0
-mediapipe>=0.8.0
-numpy>=1.21.0
-scikit-learn>=1.0.0
-matplotlib>=3.3.0
-seaborn>=0.11.0
-tqdm>=4.62.0
-pandas>=1.3.0
+# Core Deep Learning
+torch==1.13.1
+torchvision==0.14.1
+
+# Computer Vision
+opencv-python==4.12.0
+mediapipe==0.10.14
+
+# Scientific Computing
+numpy==1.25.2
+pandas==2.3.3
+scikit-learn==1.7.2
+
+# Visualization
+matplotlib==3.10.7
+seaborn==0.13.2
+
+# Utilities
+tqdm==4.67.1
+
+# Optional: Web UI (if using visualize_gui.py)
+gradio==6.0.1
+
+# Optional: Jupyter Notebooks
 jupyter>=1.0.0
-gradio>=3.0.0

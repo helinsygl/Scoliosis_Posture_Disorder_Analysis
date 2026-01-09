@@ -192,6 +192,7 @@ def main():
     parser.add_argument("--model_name", default="best_model", help="Model adı")
     parser.add_argument("--device", default="cuda", help="Device (cuda/cpu)")
     parser.add_argument("--seed", type=int, default=123, help="Random seed (tutarlı sonuçlar için, 123 en iyi sonuç)")
+    parser.add_argument("--include_side", action="store_true", help="Side videoları da dahil et (front + side)")
     
     args = parser.parse_args()
     
@@ -208,7 +209,8 @@ def main():
         args.keypoints_dir, 
         augment=True,
         batch_size=args.batch_size,
-        person_based_split=True  # Doğru kişi ID'leri ile aktif
+        person_based_split=True,  # Doğru kişi ID'leri ile aktif
+        include_side_videos=args.include_side  # Side videoları dahil et
     )
     
     # Class weights hesapla (sınıf dengesizliği için)
