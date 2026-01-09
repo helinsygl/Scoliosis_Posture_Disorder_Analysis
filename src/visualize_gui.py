@@ -334,22 +334,69 @@ class ScoliosisAnalyzer:
             "detection_rate": (detected_frames/frame_idx)*100 if frame_idx > 0 else 0
         }
 
+    def convert_video_for_web(self, video_path):
+        """
+        Converts AVI/MOV to WebM/MP4 for browser playback if needed.
+        Returns path to converted video or original if no conversion needed.
+        """
+        if not video_path:
+            return None
+            
+        ext = os.path.splitext(video_path)[1].lower()
+        if ext in ['.mp4', '.webm']:
+            return video_path
+            
+        # Needs conversion
+        print(f"Converting {ext} to web-friendly format...")
+        
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return video_path
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = int(cap.get(cv2.CAP_PROP_FPS) or 30)
+        
+        # Resize if too big (same as process optimization)
+        max_height = 640
+        if height > max_height:
+            scale = max_height / height
+            width = int(width * scale)
+            height = max_height
+
+        temp_output = tempfile.NamedTemporaryFile(suffix='.webm', delete=False).name
+        
+        # Try VP8 for best browser support via OpenCV
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*'vp80')
+            out = cv2.VideoWriter(temp_output, fourcc, fps, (width, height))
+            
+            if not out.isOpened():
+                # Fallback to mp4v
+                temp_output = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(temp_output, fourcc, fps, (width, height))
+                
+            if out.isOpened():
+                while True:
+                    ret, frame = cap.read()
+                    if not ret: break
+                    if frame.shape[0] != height or frame.shape[1] != width:
+                        frame = cv2.resize(frame, (width, height))
+                    out.write(frame)
+                out.release()
+                cap.release()
+                return temp_output
+        except Exception as e:
+            print(f"Conversion failed: {e}")
+            
+        cap.release()
+        return video_path
+
 # --- UI Logic & Events ---
 analyzer = ScoliosisAnalyzer()
 
-def go_to_analysis(model_name):
-    if not model_name:
-        return gr.update(), gr.update(), "⚠️ Please select a model first."
-    
-    success, msg = analyzer.load_model(model_name)
-    if not success:
-        return gr.update(), gr.update(), f"❌ {msg}"
-    
-    # Return: (visible=False for step 1), (visible=True for step 2), (info update)
-    return gr.update(visible=False), gr.update(visible=True), ""
 
-def go_back():
-    return gr.update(visible=True), gr.update(visible=False)
 
 def ui_video_change(video):
     if video is None:
@@ -359,13 +406,14 @@ def ui_video_change(video):
 def ui_video_clear():
     return None, "", "Waiting for video...", None
 
-def ui_process_video(video, progress=gr.Progress()):
+def ui_process_video(video):
     if video is None:
         return None, "", "Please upload a video first."
     
     if analyzer.model is None:
         return None, "", "Error: Model detached. Please go back and reload."
             
+    progress = gr.Progress()
     progress(0, desc="Initializing...")
     
     def update_progress(current, total):
@@ -453,82 +501,112 @@ body { font-family: 'Inter', system-ui, sans-serif; background-color: #f8fafc; }
     background: #f1f5f9 !important;
     color: #475569 !important;
 }
+
+/* Hide Tabs for Wizard Flow */
+.hidden-tabs > .tab-nav { display: none !important; }
 """
+
 
 # --- App Layout ---
 with gr.Blocks(title="Scoliosis Analysis AI") as demo:
     gr.HTML(f"<style>{custom_css}</style>")
-    
-    with gr.Column(elem_classes="container"):
-        
-        # Header
-        gr.HTML("""
-        <div class="header">
-            <h1>Scoliosis Analysis AI</h1>
-            <p>Professional Posture Assessment System</p>
-        </div>
-        """)
-        
-        # --- Step 1: Model Selection ---
-        with gr.Group(visible=True) as step_1_group:
-            gr.HTML("""
-            <div class="wizard-card">
-                <div style="font-size: 3rem; margin-bottom: 1rem;">🧠</div>
-                <h2 style="font-size: 1.5rem; font-weight: 700; margin-bottom: 2rem; color: #1e293b;">Select AI Model</h2>
-            """)
-            
-            with gr.Column(scale=1):
-                model_dropdown = gr.Dropdown(
-                    choices=analyzer.get_available_models(),
-                    label="",
-                    show_label=False,
-                    value=analyzer.get_available_models()[0] if analyzer.get_available_models() else None,
-                    interactive=True,
-                    container=False
-                )
-                
-                next_btn = gr.Button("Next ➜", variant="primary", elem_classes="primary-btn")
-                
-                error_box = gr.Markdown("", visible=True)
-            
-            gr.HTML("</div>") # Close card
 
-        # --- Step 2: Analysis ---
-        with gr.Group(visible=False) as step_2_group:
-            with gr.Row():
-                back_btn = gr.Button("⬅ Change Model", size="sm", variant="secondary", scale=0)
-            
-            with gr.Row(equal_height=True):
-                # Left: Input
+    app_state = gr.State({}) # Store global app state if needed
+
+    with gr.Tabs(selected=0, elem_classes="hidden-tabs") as app_tabs:
+        
+        # --- Tab 1: Model Selection ---
+        with gr.Tab(label="Selection", id=0):
+             with gr.Column(elem_classes="container"):
+                # Header (Repeated or global? Global is better but let's put it in container)
+                gr.HTML("""
+                <div class="header">
+                    <h1>Scoliosis Analysis AI</h1>
+                    <p>Professional Posture Assessment System</p>
+                </div>
+                """)
+                
+                gr.HTML("""
+                <div class="wizard-card">
+                    <div style="font-size: 3rem; margin-bottom: 1rem;">🧠</div>
+                    <h2 style="font-size: 1.5rem; font-weight: 700; margin-bottom: 2rem; color: #1e293b;">Select AI Model</h2>
+                """)
+                
                 with gr.Column(scale=1):
-                    gr.Markdown("### 📹 Upload Video")
-                    input_video = gr.Video(label="Input Video")
-                    analyze_btn = gr.Button("✨ Run Analysis", variant="primary", elem_classes="primary-btn", size="lg")
+                    model_dropdown = gr.Dropdown(
+                        choices=analyzer.get_available_models(),
+                        label="",
+                        show_label=False,
+                        value=analyzer.get_available_models()[0] if analyzer.get_available_models() else None,
+                        interactive=True,
+                        container=False
+                    )
                     
-                    gr.Markdown("---")
-                    stats_output = gr.Markdown("Waiting for video...")
+                    next_btn = gr.Button("Next ➜", variant="primary", elem_classes="primary-btn")
+                    
+                    error_box = gr.Markdown("", visible=True)
+                
+                gr.HTML("</div>") # Close card
 
-                # Right: Output
-                with gr.Column(scale=1):
-                    gr.Markdown("### 🎯 Results")
-                    output_video = gr.Video(label="Processed Output", interactive=False, autoplay=True)
-                    prediction_result = gr.HTML(label="Prediction")
+        # --- Tab 2: Analysis ---
+        with gr.Tab(label="Analysis", id=1):
+            with gr.Column(elem_classes="container"):
+                 # Smaller Header for Analysis Page
+                gr.HTML("""
+                <div class="header" style="margin-bottom: 2rem;">
+                    <h1 style="font-size: 2rem;">Analysis Dashboard</h1>
+                </div>
+                """)
+                
+                with gr.Row():
+                    back_btn = gr.Button("⬅ Change Model", size="sm", variant="secondary", scale=0)
+                
+                with gr.Row(equal_height=True):
+                    # Left: Input
+                    with gr.Column(scale=1):
+                        gr.Markdown("### 📹 Upload Video")
+                        input_video = gr.Video(label="Input Video")
+                        analyze_btn = gr.Button("✨ Run Analysis", variant="primary", elem_classes="primary-btn", size="lg")
+                        
+                        gr.Markdown("---")
+                        stats_output = gr.Markdown("Waiting for video...")
+
+                    # Right: Output
+                    with gr.Column(scale=1):
+                        gr.Markdown("### 🎯 Results")
+                        output_video = gr.Video(label="Processed Output", interactive=False, autoplay=True)
+                        prediction_result = gr.HTML(label="Prediction")
 
     # --- Event Wiring ---
     
+    def go_to_analysis_tab(model_name):
+        if not model_name:
+            return gr.update(), "⚠️ Please select a model first."
+        
+        success, msg = analyzer.load_model(model_name)
+        if not success:
+            return gr.update(), f"❌ {msg}"
+        
+        # Switch to Tab 1 (Analysis)
+        return gr.Tabs(selected=1), ""
+
+    def go_back_tab():
+        # Switch to Tab 0 (Selection)
+        return gr.Tabs(selected=0)
+
     # Next Button Click
     next_btn.click(
-        fn=go_to_analysis,
+        fn=go_to_analysis_tab,
         inputs=[model_dropdown],
-        outputs=[step_1_group, step_2_group, error_box],
+        outputs=[app_tabs, error_box],
         show_progress="hidden"
     )
     
     # Back Button Click
     back_btn.click(
-        fn=go_back,
+        fn=go_back_tab,
         inputs=[],
-        outputs=[step_1_group, step_2_group],
+        outputs=[app_tabs],
         show_progress="hidden"
     )
     
